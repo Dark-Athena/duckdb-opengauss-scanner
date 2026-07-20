@@ -107,6 +107,27 @@ jobs:
           test -n "$HDR" && cp -a "$(dirname "$HDR")"/* libpq/include/
           test -f libpq/include/libpq-fe.h
           ls libpq/lib/libpq.so*
+          # GaussDB(Kylin V10) 的 libpq 链接 OpenSSL 1.1(libpq.so 的 NEEDED 为
+          # libssl.so.1.1 / libcrypto.so.1.1), 但驱动包内只带无版本名的
+          # libssl.so / libcrypto.so, 版本化实体依赖 OS 提供。manylinux_2_28
+          # (AlmaLinux 8) 自带 OpenSSL 1.1.1, 把版本化实体放进 libpq/lib,
+          # 让 build 脚本的依赖闭包 bundler 一并打包 —— 否则产物在不带
+          # OpenSSL 1.1 的系统(如 Ubuntu 22.04+/openssl3)上会 LOAD 失败:
+          # "libssl.so.1.1: cannot open shared object file"。
+          copy_openssl11() {
+            local name="$1" stem="${1%%.so*}" d
+            for d in /usr/lib64 /lib64 /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
+              if [ -e "$d/$name" ]; then cp -Lf "$d/$name" "libpq/lib/$name"; return 0; fi
+            done
+            # 退回包内无版本名实体(若确为真实 ELF)
+            if [ -e "libpq/lib/${stem}.so" ] && [ ! -L "libpq/lib/${stem}.so" ]; then
+              cp -Lf "libpq/lib/${stem}.so" "libpq/lib/$name"; return 0
+            fi
+            return 1
+          }
+          copy_openssl11 libssl.so.1.1    || { echo "ERROR: 找不到 libssl.so.1.1 来源"; exit 1; }
+          copy_openssl11 libcrypto.so.1.1 || { echo "ERROR: 找不到 libcrypto.so.1.1 来源"; exit 1; }
+          ls -l libpq/lib/libssl.so.1.1 libpq/lib/libcrypto.so.1.1
 
       # -----------------------------------------------------------------------
       # 构建扩展 (复用仓库的 build_opengauss_scanner.sh, 官方 ninja 生成器)

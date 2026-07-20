@@ -30,7 +30,7 @@
 
 | 依赖 | 说明 |
 |---|---|
-| `cmake`、`make`、`g++` | 编译工具链(C++17) |
+| `cmake`、`make`、`g++` | 编译工具链(C++17)。**GCC 必须 ≥ 8**(推荐 11+)，见[第十一节](#十一duckdb-官方预编译版本的编译依赖链)。GCC 7 会在链接期报 `undefined reference to std::allocator<...>::allocator()` |
 | `ninja` | 可选，指定 `--ninja` 时需要 |
 | `python3` | 仅用于给上游源码打补丁(多行/正则/JSON 编辑 + fail-fast 校验)，几乎所有环境自带 |
 | `libssl-dev` | 编译时需要 OpenSSL 开发头文件 |
@@ -93,7 +93,8 @@ libpq/
     └── lib*_gauss.so*      # openGauss 专属 krb5 / gss / com_err 等
 ```
 
-如果连接华为GaussDB,建议使用华为官方提供的GaussDB的libpq，连接其他openGauss发行版也均建议使用发行厂家单独提供的libpq
+**如果连接华为GaussDB,建议使用华为官方提供的GaussDB的libpq，连接其他openGauss发行版也均建议使用发行厂家单独提供的libpq**
+
 ---
 
 ## 四、使用方法
@@ -276,4 +277,86 @@ cd ../.. && git submodule update --init --recursive
    CLI** `duckdb-postgres/build/release/duckdb`(即本次子模块的版本，天然匹配，测试脚本默认就用它)；
    若用外部 duckdb 需下载同一版本。
 2. **切换版本后清理旧产物再编译**：`rm -rf duckdb-postgres/build dist`。
+
+---
+
+## 十一、DuckDB 官方预编译版本的编译依赖链
+
+本项目产物是 DuckDB **可加载扩展**，最终要被官方发行的 DuckDB 加载运行。官方的 Linux 预编译
+二进制(含 CLI 与扩展)全部在**固定的容器工具链**里构建，其配置直接来自
+`duckdb-postgres/extension-ci-tools/docker/*/Dockerfile`(由 duckdb 发版 CI 调用)。要让自编译的
+扩展与官方运行时二进制/ABI 匹配，本地编译环境应尽量向这条链看齐。
+
+### 官方各平台工具链一览
+
+| 平台 (`DUCKDB_PLATFORM`) | 基础镜像 | 发行版 | 编译器 | glibc / libc 基线 |
+|---|---|---|---|---|
+| `linux_amd64` | `quay.io/pypa/manylinux_2_28_x86_64` | AlmaLinux 8 | **GCC(gcc-toolset)**，当前 GCC 14 | **glibc ≥ 2.28** |
+| `linux_arm64` | `quay.io/pypa/manylinux_2_28_aarch64` | AlmaLinux 8 | **GCC(gcc-toolset)**，当前 GCC 14 | **glibc ≥ 2.28** |
+| `linux_amd64_musl` | `alpine:3.22` | Alpine | GCC / clang19 | musl libc |
+| `linux_arm64_musl` | `alpine:*`(同上) | Alpine | GCC / clang19 | musl libc |
+
+补充要点(来自 Dockerfile 与 manylinux 官方说明)：
+
+- **glibc 基线 2.28**：`manylinux_2_28` 保证产物可在 glibc ≥ 2.28 的发行版运行
+  (Debian 10+ / Ubuntu 18.10+ / CentOS·RHEL 8+ / **Kylin V10**)。这是"最低运行门槛"，
+  本地 glibc **等于或高于** 2.28 都可以。
+- **编译器为较新的 GCC**：manylinux 镜像随时间升级其 gcc-toolset(历史上 11→12→13，当前为
+  **GCC 14**)。官方并不用某个精确的 GCC 小版本，但**都是 GCC 8 以上的现代版本**。
+- **构建系统**：CMake(官方镜像用 4.0.2) + **Ninja**(`GEN=ninja`) + ccache；vcpkg 提供第三方依赖。
+  本项目不强制这些(用系统 CMake≥3.5、Makefiles 或 Ninja 均可)，仅编译器版本是硬约束。
+
+### 对本地/自编译环境的要求
+
+| 项目 | 要求 | 说明 |
+|---|---|---|
+| **GCC** | **≥ 8，推荐 11+** | DuckDB 源码是 C++17。**GCC 7 会失败**:链接期报 `undefined reference to std::allocator<duckdb::Value>::allocator()` —— 这是 GCC 7 libstdc++ 对部分模板类型未内联发射 `allocator` 默认构造函数的已知缺陷，GCC 8 已修复。要贴近官方可用 GCC 11+。 |
+| **glibc** | **≥ 2.28** | 与官方 `manylinux_2_28` 一致即可;低于 2.28 也许能自编译,但产物无法在官方运行时环境保证兼容。 |
+| CMake | ≥ 3.5 | duckdb v1.5.3 声明 `cmake_minimum_required(3.5...3.29)`;`CMAKE_CXX_STANDARD=11`,实际按源码需要拉到 C++17。 |
+| clang | 亦可 | 官方 musl 镜像用 clang19;若本地用 clang,版本需完整支持 C++17。 |
+
+> 💡 **为什么 Kylin V10 / 老 CentOS 8 上默认 gcc 7.3.0 编不过**:这类系统 **glibc 2.28 达标**,
+> 但**自带 GCC 7 过老**。解决办法是装一个更新的 GCC 后再构建,例如:
+> ```bash
+> # openEuler / Kylin V10(dnf/yum):安装 gcc-toolset
+> sudo dnf install -y gcc-toolset-11-gcc gcc-toolset-11-gcc-c++
+> source /opt/rh/gcc-toolset-11/enable   # 仅当前 shell 生效
+> gcc --version                          # 确认 >= 8(此处为 11)
+> # 然后照常运行构建脚本
+> ./build_opengauss_scanner.sh --jobs 8
+> ```
+> 若源不含 `gcc-toolset`,可从源码编译 GCC 11+ 或改用具备新版 GCC 的构建机;
+> 最贴近官方的做法是直接在 `manylinux_2_28` 容器内构建。
+
+---
+
+## 十二、GitHub Actions 自动化构建与发布
+
+仓库内置 `.github/workflows/build.yml`,**按 DuckDB 官方构建方案**(在
+`quay.io/pypa/manylinux_2_28_{x86_64,aarch64}` 容器内, gcc-toolset / glibc 2.28)自动产出
+**4 个可分发压缩包**:
+
+| variant | platform | 压缩包 | 使用的 libpq |
+|---|---|---|---|
+| openGauss | linux_amd64 | `opengauss_scanner-opengauss-linux_amd64.zip` | openGauss 官方预编译 libpq(x86_64) |
+| openGauss | linux_arm64 | `opengauss_scanner-opengauss-linux_arm64.zip` | openGauss 官方预编译 libpq(aarch64) |
+| GaussDB | linux_amd64 | `opengauss_scanner-gaussdb-linux_amd64.zip` | 华为 GaussDB 驱动包 **Kylin V10 / X86_64** 版 libpq |
+| GaussDB | linux_arm64 | `opengauss_scanner-gaussdb-linux_arm64.zip` | 华为 GaussDB 驱动包 **Kylin V10 / arm_64** 版 libpq |
+
+- **openGauss libpq**:直接下载[第三节](#三libpq-目录结构)给出的官方 tar.gz。
+- **GaussDB libpq**:参照华为
+  [install_gaussdb_driver.sh](https://github.com/huaweicloud-samples/database-gaussdb-python/blob/master/tools/install_gaussdb_driver.sh)
+  的方式下载 `GaussDB_driver.zip`,但**只取 `Centralized/Kylinv10_<ARCH>/` 里的 libpq**。
+- **自动测试**:在 `linux_amd64` 上拉起
+  [opengauss docker](https://github.com/huaweicloud-samples/database-gaussdb-python/blob/master/.github/workflows/tests.yml)
+  (`opengauss/opengauss-server:latest`),用**本次同版本产出的 DuckDB CLI** 做
+  `LOAD` + `ATTACH (TYPE opengauss)` + 查询的冒烟测试(两种 variant 都测:GaussDB 版扩展同样以
+  sha256 连接 openGauss 服务端)。
+- **发布**:推送 `v*` tag 时,自动把 4 个压缩包挂到 GitHub Release。
+
+触发方式:push / pull_request / 手动(`workflow_dispatch`)/ 打 `v*` tag(额外触发发布)。
+
+> arm64 构建在 GitHub 托管的 `ubuntu-24.04-arm` 原生 runner 上进行(非 QEMU 模拟);
+> 自动测试仅在 amd64 执行,arm64 为纯构建。
+
 

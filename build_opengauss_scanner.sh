@@ -404,6 +404,11 @@ log "== 阶段2: 构建扩展 (不启用 vcpkg，链接 openGauss libpq) =="
 
 # 显式清空 vcpkg toolchain，确保 find_package(OpenSSL) 走系统库、libpq 走我们的补丁
 export VCPKG_TOOLCHAIN_PATH=""
+# 让底层 `cmake --build` 并行: extension-ci-tools 的 release 配方调用
+# `cmake --build`(不带 -j)，用 Makefiles 生成器时会退化为串行(只有一个 cc1plus)。
+# CMAKE_BUILD_PARALLEL_LEVEL(CMake>=3.12) 会被 cmake --build 读取并传给底层
+# make/ninja —— 对两种生成器都生效, 无 ninja 时也能真正并行。
+export CMAKE_BUILD_PARALLEL_LEVEL="${JOBS}"
 EXT_FLAGS="-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON"
 GEN_FLAG=""
 [[ ${GEN_NINJA} -eq 1 ]] && GEN_FLAG="GEN=ninja"

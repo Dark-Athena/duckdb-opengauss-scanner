@@ -1,0 +1,265 @@
+name: Build & Release
+
+# 按 DuckDB 官方构建方案(manylinux_2_28 容器: gcc-toolset / glibc 2.28)在
+# linux_amd64 与 linux_arm64 两个平台上, 分别为 openGauss 与 GaussDB 两种 libpq
+# 各构建一个可分发压缩包, 共 4 个:
+#   opengauss_scanner-opengauss-linux_amd64.zip
+#   opengauss_scanner-opengauss-linux_arm64.zip
+#   opengauss_scanner-gaussdb-linux_amd64.zip
+#   opengauss_scanner-gaussdb-linux_arm64.zip
+# 并在 linux_amd64 上用 openGauss docker 做加载/连接冒烟测试; 打 tag(v*) 时发 Release。
+
+on:
+  push:
+    branches: ["*"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 构建: 2 variant × 2 platform = 4 个产物
+  # ---------------------------------------------------------------------------
+  build:
+    name: build-${{ matrix.variant }}-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [opengauss, gaussdb]
+        platform: [linux_amd64, linux_arm64]
+        include:
+          - platform: linux_amd64
+            runner: ubuntu-latest
+            image: quay.io/pypa/manylinux_2_28_x86_64
+            gauss_arch: X86_64
+            og_url: https://opengauss.obs.cn-south-1.myhuaweicloud.com/6.0.5/openEuler20.03/x86/openGauss-Libpq-6.0.5-openEuler20.03-x86_64.tar.gz
+          - platform: linux_arm64
+            runner: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64
+            gauss_arch: arm_64
+            og_url: https://opengauss.obs.cn-south-1.myhuaweicloud.com/6.0.5/openEuler20.03/arm/openGauss-Libpq-6.0.5-openEuler20.03-aarch64.tar.gz
+    steps:
+      # manylinux_2_28 = AlmaLinux 8(dnf), 默认 gcc = gcc-toolset(GCC 14), glibc 2.28。
+      # 只需补齐 cmake/ninja/openssl 头文件/下载与打包工具; 编译器已就位。
+      - name: Prepare toolchain (in manylinux container)
+        run: |
+          set -eux
+          dnf install -y openssl-devel ninja-build cmake git python3 wget unzip zip findutils tar
+          # extension-ci-tools 用 -G Ninja, cmake 找 ninja 可执行名; AlmaLinux 提供 ninja-build
+          ln -sf "$(command -v ninja-build)" /usr/local/bin/ninja
+          # 允许 git 操作被 root 挂载进来的工作区(避免 dubious ownership)
+          git config --global --add safe.directory '*'
+          gcc --version
+          cmake --version
+          ninja --version
+
+      - name: Checkout (recursive submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      # -----------------------------------------------------------------------
+      # 准备 libpq: openGauss 用官方预编译包; GaussDB 用华为驱动包里的 Kylin 版
+      # -----------------------------------------------------------------------
+      - name: Prepare openGauss libpq
+        if: matrix.variant == 'opengauss'
+        env:
+          OG_URL: ${{ matrix.og_url }}
+        run: |
+          set -eux
+          rm -rf libpq && mkdir -p libpq
+          wget -q -O og-libpq.tar.gz "$OG_URL"
+          # 官方包顶层多一层目录, strip 掉后即为 libpq/{include,lib}
+          tar -xzf og-libpq.tar.gz -C libpq --strip-components=1
+          test -f libpq/include/libpq-fe.h
+          ls libpq/lib/libpq.so*
+
+      - name: Prepare GaussDB libpq (Kylin only)
+        if: matrix.variant == 'gaussdb'
+        env:
+          # 与 install_gaussdb_driver.sh 一致的官方驱动包地址
+          GAUSS_URL: https://dbs-download.obs.cn-north-1.myhuaweicloud.com/GaussDB/1730887196055/GaussDB_driver.zip
+          GAUSS_ARCH: ${{ matrix.gauss_arch }}   # X86_64 或 arm_64
+        run: |
+          set -eux
+          rm -rf gaussdb_dl gaussdb_extract libpq
+          mkdir -p gaussdb_dl gaussdb_extract libpq/include libpq/lib
+          wget -q -O GaussDB_driver.zip "$GAUSS_URL"
+          unzip -q GaussDB_driver.zip -d gaussdb_dl
+          KDIR="gaussdb_dl/GaussDB_driver/Centralized/Kylinv10_${GAUSS_ARCH}"
+          test -d "$KDIR" || { echo "未找到 Kylin 驱动目录: $KDIR"; ls -R gaussdb_dl/GaussDB_driver/Centralized | head -50; exit 1; }
+          # 解压该 Kylin 目录下所有 tar.gz(含 libpq 与头文件), 再按内容装配 libpq/
+          for tb in "$KDIR"/*.tar.gz; do
+            tar --no-same-owner -xzf "$tb" -C gaussdb_extract || true
+          done
+          # 拷贝 libpq.so* 及其同目录依赖库(*_gauss / ssl / crypto 等)
+          LIBSRC="$(dirname "$(find gaussdb_extract -name 'libpq.so*' | head -n1)")"
+          test -n "$LIBSRC" && cp -a "$LIBSRC"/*.so* libpq/lib/
+          # 拷贝 libpq-fe.h 所在目录的全部头文件(含 gs_thread.h / postgres_ext.h / libpq/ 子目录)
+          HDR="$(find gaussdb_extract -name 'libpq-fe.h' | head -n1)"
+          test -n "$HDR" && cp -a "$(dirname "$HDR")"/* libpq/include/
+          test -f libpq/include/libpq-fe.h
+          ls libpq/lib/libpq.so*
+
+      # -----------------------------------------------------------------------
+      # 构建扩展 (复用仓库的 build_opengauss_scanner.sh, 官方 ninja 生成器)
+      # -----------------------------------------------------------------------
+      - name: Build extension
+        run: |
+          set -eux
+          chmod +x build_opengauss_scanner.sh
+          ./build_opengauss_scanner.sh \
+            --libpq-dir "$PWD/libpq" \
+            --output    "$PWD/dist" \
+            --ninja
+          echo "---- 产物 ----"
+          ls -R dist
+          readelf -d dist/opengauss_scanner.duckdb_extension | grep -E 'RPATH|RUNPATH' || true
+
+      - name: Package
+        id: pkg
+        run: |
+          set -eux
+          PKG="opengauss_scanner-${{ matrix.variant }}-${{ matrix.platform }}"
+          ( cd dist && zip -r "../${PKG}.zip" . )
+          echo "pkg=${PKG}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.pkg }}
+          path: ${{ steps.pkg.outputs.pkg }}.zip
+          if-no-files-found: error
+
+      # 冒烟测试需要一个版本完全匹配的 DuckDB CLI —— 直接用本次构建同时产出的那个,
+      # 天然与扩展的 duckdb source id 一致。仅 amd64 需要(测试只在 amd64 跑)。
+      - name: Stage matching DuckDB CLI (amd64 only)
+        if: matrix.platform == 'linux_amd64'
+        run: |
+          set -eux
+          CLI="$(find duckdb-postgres/build/release -maxdepth 2 -name duckdb -type f | head -n1)"
+          test -n "$CLI"
+          cp "$CLI" duckdb
+
+      - name: Upload DuckDB CLI artifact (amd64 only)
+        if: matrix.platform == 'linux_amd64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-cli-${{ matrix.variant }}-linux_amd64
+          path: duckdb
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 测试: 在 linux_amd64 上用 openGauss docker 做加载 + 连接 + 查询冒烟测试
+  # (GaussDB 版的扩展链接 GaussDB libpq, 同样以 sha256 连接 openGauss 服务端)
+  # ---------------------------------------------------------------------------
+  test:
+    name: test-${{ matrix.variant }}-linux_amd64
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [opengauss, gaussdb]
+    services:
+      opengauss:
+        image: opengauss/opengauss-server:latest
+        env:
+          GS_USERNAME: root
+          GS_USER_PASSWORD: Passwd@123
+          GS_PASSWORD: Passwd@123
+        ports:
+          - 5432:5432
+        options: >-
+          --privileged=true --name opengauss-custom
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@v4
+        with:
+          name: opengauss_scanner-${{ matrix.variant }}-linux_amd64
+          path: dl
+
+      - name: Download DuckDB CLI
+        uses: actions/download-artifact@v4
+        with:
+          name: duckdb-cli-${{ matrix.variant }}-linux_amd64
+          path: dl-cli
+
+      - name: Unpack
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y unzip postgresql-client
+          mkdir -p dist
+          unzip -o "dl/opengauss_scanner-${{ matrix.variant }}-linux_amd64.zip" -d dist
+          cp dl-cli/duckdb ./duckdb
+          chmod +x ./duckdb
+          ls -R dist
+
+      - name: Wait for openGauss
+        run: |
+          set -eux
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5432; then echo "ready"; break; fi
+            sleep 10
+          done
+          pg_isready -h 127.0.0.1 -p 5432
+
+      - name: Create test database & data
+        run: |
+          set -eux
+          cat > setup.sql <<'SQL'
+          CREATE TABLE IF NOT EXISTS t(id int, name text);
+          INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c');
+          GRANT USAGE ON SCHEMA public TO root;
+          GRANT SELECT ON t TO root;
+          SQL
+          docker cp setup.sql opengauss-custom:/tmp/setup.sql
+          docker exec opengauss-custom bash -c "su - omm -c 'gsql -d postgres -c \"CREATE DATABASE test;\"'"
+          docker exec opengauss-custom bash -c "su - omm -c 'gsql -d test -f /tmp/setup.sql'"
+
+      - name: Smoke test (LOAD + ATTACH + query)
+        run: |
+          set -eux
+          EXT="$PWD/dist/opengauss_scanner.duckdb_extension"
+          test -f "$EXT"
+          ./duckdb -unsigned -c "
+            LOAD '${EXT}';
+            ATTACH 'host=127.0.0.1 port=5432 dbname=test user=root password=Passwd@123' AS og (TYPE opengauss);
+            SELECT 'ROWS=' || count(*) AS r FROM og.public.t;
+          " | tee out.txt
+          grep -q 'ROWS=3' out.txt
+
+  # ---------------------------------------------------------------------------
+  # 发布: 打 v* tag 时, 把 4 个压缩包挂到 GitHub Release
+  # ---------------------------------------------------------------------------
+  release:
+    name: release
+    needs: [build, test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: opengauss_scanner-*
+          path: artifacts
+
+      - name: List
+        run: find artifacts -type f -name '*.zip'
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true

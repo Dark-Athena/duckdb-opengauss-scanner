@@ -1,0 +1,18 @@
+# ---- 构建产物 / 运行时输出 ----
+/dist/
+build.log
+*.ogbak          # 构建脚本打补丁时的临时备份(正常会被 trap 自动清理)
+
+# ---- 使用者自备的依赖(不随仓库分发) ----
+# openGauss 预编译 libpq(含 include/ 与 lib/*.so)，构建时用 --libpq-dir 指定。
+/libpq/
+/gaussdb_libpq/
+
+# ---- 与本项目无关的外部源码树(如误放此处) ----
+/openGauss-server/
+
+# ---- 临时 / 编辑器 ----
+og_conn_test
+*.o
+*.swp
+.DS_Store

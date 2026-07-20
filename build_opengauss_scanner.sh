@@ -112,6 +112,33 @@ edit_begin() {  # $1 = file (相对 PG_SRC_DIR)
 	BACKED_UP+=("${f}")
 }
 
+# 对某源码文件做“带引号字面量”的全局重命名替换。
+# 用法: rebrand_replace <相对文件> old1 new1 [old2 new2 ...]
+# 每个 old 必须至少匹配 1 处(否则报错), 用带引号的字面量避免子串误伤
+# (如 "postgres_scan" 不会命中 "postgres_scan_pushdown")。
+rebrand_replace() {
+	local rel="$1"; shift
+	edit_begin "${rel}"
+	python3 - "${PG_SRC_DIR}/${rel}" "$@" <<'PYEOF'
+import sys, io
+p = sys.argv[1]
+pairs = sys.argv[2:]
+assert len(pairs) % 2 == 0, "old/new 参数必须成对: " + p
+with io.open(p, encoding="utf-8") as f:
+    s = f.read()
+total = 0
+for i in range(0, len(pairs), 2):
+    old, new = pairs[i], pairs[i + 1]
+    c = s.count(old)
+    assert c >= 1, "未找到待替换字面量 %r (in %s)" % (old, p)
+    s = s.replace(old, new)
+    total += c
+with io.open(p, "w", encoding="utf-8") as f:
+    f.write(s)
+print("[rebrand] %s: %d 处" % (p, total))
+PYEOF
+}
+
 log "== 阶段1: 对源码打临时补丁 =="
 
 # (a) 改名: Makefile EXT_NAME
@@ -205,10 +232,83 @@ entry_old = "DUCKDB_CPP_EXTENSION_ENTRY({},".format(old)
 entry_new = "DUCKDB_CPP_EXTENSION_ENTRY({},".format(new)
 assert entry_old in s, "未找到扩展入口宏 " + entry_old
 s = s.replace(entry_old, entry_new, 1)
+# [全量重命名] 与官方 postgres_scanner 同实例共存: secret 类型/函数、
+# 存储扩展键、per-connection state 键、text 协议开关 全部改为独立命名。
+assert '= {"postgres", "config",' in s, "未找到 secret 函数声明"
+s = s.replace('= {"postgres", "config",', '= {"opengauss", "config",')
+assert 'StorageExtension::Register(config, "postgres_scanner"' in s, "未找到存储扩展注册键"
+s = s.replace('StorageExtension::Register(config, "postgres_scanner"',
+              'StorageExtension::Register(config, "opengauss"')
+assert s.count('"postgres_extension"') == 2, "registered_state 键数量异常"
+s = s.replace('"postgres_extension"', '"opengauss_extension"')
+assert '"pg_use_text_protocol"' in s, "未找到 pg_use_text_protocol 选项名"
+s = s.replace('"pg_use_text_protocol"', '"opengauss_use_text_protocol"')
 with io.open(p, "w", encoding="utf-8") as f:
     f.write(s)
 print("[patch] pg_use_text_protocol 默认 false->true; 入口宏 {} -> {}".format(old, new))
+print("[rebrand] postgres_extension.cpp: secret/storage/state/option 独立命名")
 PYEOF
+
+# (d1b) 全量重命名: 所有对外函数名 postgres_*/pg_* -> opengauss_*，
+#       并同步内部按名调用/判断处，确保与官方 postgres_scanner 在同一 DuckDB
+#       实例内共存不冲突(TYPE opengauss + opengauss_* 函数, 官方仍用 TYPE postgres)。
+log "== 阶段1b: 全量重命名(与官方 postgres_scanner 同实例共存) =="
+
+rebrand_replace "src/postgres_scanner.cpp" \
+	'"postgres_scan_pushdown"' '"opengauss_scan_pushdown"' \
+	'"postgres_scan"' '"opengauss_scan"' \
+	'"pg_use_text_protocol"' '"opengauss_use_text_protocol"'
+
+rebrand_replace "src/postgres_query.cpp" \
+	'"postgres_query"' '"opengauss_query"'
+
+rebrand_replace "src/postgres_execute.cpp" \
+	'"postgres_execute"' '"opengauss_execute"'
+
+rebrand_replace "src/postgres_attach.cpp" \
+	'"postgres_scan_pushdown"' '"opengauss_scan_pushdown"' \
+	'"postgres_scan"' '"opengauss_scan"' \
+	'"postgres_attach"' '"opengauss_attach"'
+
+rebrand_replace "src/storage/postgres_clear_cache.cpp" \
+	'"pg_clear_cache"' '"opengauss_clear_cache"'
+
+rebrand_replace "src/postgres_binary_copy.cpp" \
+	'read_postgres_binary' 'read_opengauss_binary' \
+	'"postgres_binary"' '"opengauss_binary"'
+
+rebrand_replace "src/storage/postgres_configure_pool.cpp" \
+	'"postgres_configure_pool"' '"opengauss_configure_pool"'
+
+rebrand_replace "src/postgres_hstore.cpp" \
+	'"postgres_hstore_get"' '"opengauss_hstore_get"' \
+	'"postgres_hstore_to_json"' '"opengauss_hstore_to_json"'
+
+# 内部按名判断/调用: 把 postgres_scan/pushdown/query 三个名同步改掉
+rebrand_replace "src/storage/postgres_insert.cpp" \
+	'"postgres_scan_pushdown"' '"opengauss_scan_pushdown"' \
+	'"postgres_scan"' '"opengauss_scan"' \
+	'"postgres_query"' '"opengauss_query"'
+
+rebrand_replace "src/storage/postgres_optimizer.cpp" \
+	'"postgres_scan"' '"opengauss_scan"'
+
+# secret 类型: "postgres"/"rds" 是全局唯一注册名, 必须独立以免与官方重复注册(硬报错)
+rebrand_replace "src/postgres_secrets.cpp" \
+	'secret_type.name = "postgres";' 'secret_type.name = "opengauss";' \
+	'secret_type.name = "rds";' 'secret_type.name = "opengauss_rds";' \
+	'prefix_paths, "postgres", "config"' 'prefix_paths, "opengauss", "config"'
+
+rebrand_replace "src/postgres_aws.cpp" \
+	'TYPE rds,' 'TYPE opengauss_rds,'
+
+# 扩展 Name(): 避免与官方在已加载扩展登记表里同名
+rebrand_replace "src/include/postgres_scanner_extension.hpp" \
+	'"postgres_scanner"' '"opengauss_scanner"'
+
+# 日志类型名: RegisterLogType 全局唯一, 与官方重名会硬报错
+rebrand_replace "src/include/postgres_logging.hpp" \
+	'"PostgresQueryLog"' '"OpenGaussQueryLog"'
 
 # (d2) OAuth 桩: openGauss libpq(基于 PG9.2)无新版 OAuth API(PQsetAuthDataHook 等)，
 #       postgres_oauth.cpp 无法编译。用 no-op 桩替换(openGauss 家族不使用 OAuth)，
@@ -235,11 +335,13 @@ OAuthTokenHolder SetThreadLocalOAuthTokenFromSessionOption(ClientContext &) {
 CPPEOF
 echo "[patch] postgres_oauth.cpp 已替换为 no-op 桩(兼容 openGauss libpq)"
 
-# (d3) GCC11 兼容: postgres_scanner 主分支写法 `return func_ref;`（派生类
-#      unique_ptr<TableFunctionRef> 隐式转基类 unique_ptr<TableRef>）在
-#      C++17 + GCC11 下因“具名局部返回值隐式移动 + 继承构造 + 派生转基类推导”
-#      被拒(其 CI 用 clang/更高版 gcc)。改为显式 std::move，语义等价、
-#      对上游 rebase 影响极小。
+# (d3) GCC11 兼容 + 重命名: postgres_scanner 新版(含 RemoteExecute 特性)写法
+#      `return func_ref;`（派生类 unique_ptr<TableFunctionRef> 隐式转基类
+#      unique_ptr<TableRef>）在 C++17 + GCC11 下因“具名局部返回值隐式移动 +
+#      继承构造 + 派生转基类推导”被拒(其 CI 用 clang/更高版 gcc)。改为显式
+#      std::move，语义等价。同时把该处 postgres_query 引用改名 opengauss_query。
+#      注: 该 RemoteExecute 片段是 1.5.3 之后新增, 稳定版(如 1.5.3)不含 ——
+#      因此按“锚点存在才打, 不存在则跳过”处理, 以兼容不同 duckdb 版本。
 edit_begin "src/storage/postgres_catalog.cpp"
 python3 - "${PG_SRC_DIR}/src/storage/postgres_catalog.cpp" <<'PYEOF'
 import sys, io
@@ -250,13 +352,15 @@ old = "\tauto func_ref = make_uniq<TableFunctionRef>();\n" \
       "\tfunc_ref->function = make_uniq<FunctionExpression>(\"postgres_query\", std::move(args));\n" \
       "\treturn func_ref;\n"
 new = "\tauto func_ref = make_uniq<TableFunctionRef>();\n" \
-      "\tfunc_ref->function = make_uniq<FunctionExpression>(\"postgres_query\", std::move(args));\n" \
+      "\tfunc_ref->function = make_uniq<FunctionExpression>(\"opengauss_query\", std::move(args));\n" \
       "\treturn std::move(func_ref);\n"
-assert old in s, "postgres_catalog.cpp 中未找到预期的 RemoteExecute 返回片段"
-s = s.replace(old, new, 1)
-with io.open(p, "w", encoding="utf-8") as f:
-    f.write(s)
-print("[patch] postgres_catalog.cpp: return func_ref -> return std::move(func_ref) (GCC11 兼容)")
+if old in s:
+    s = s.replace(old, new, 1)
+    with io.open(p, "w", encoding="utf-8") as f:
+        f.write(s)
+    print("[patch] postgres_catalog.cpp: return func_ref -> return std::move(func_ref) (GCC11 兼容); postgres_query -> opengauss_query")
+else:
+    print("[patch] postgres_catalog.cpp: 未见 RemoteExecute 片段(此 duckdb 版本不含该特性), 跳过")
 PYEOF
 
 # (d4) GCC11 兼容: postgres_secret_storage.cpp `return secret;`
@@ -322,6 +426,12 @@ fi
 # 定位产物 + 打包 bundle
 # ----------------------------------------------------------------------------
 log "== 阶段3: 收集产物与运行时 bundle =="
+
+# 清理上一次构建的产物, 避免残留(尤其切换 libpq 版本时: openGauss 的 *_gauss.so*
+# 与 GaussDB 的标准命名库会同时堆在 dist/lib 里)。只删本脚本已知的输出项,
+# 不对整个 OUTPUT_DIR 做 rm -rf(它可能是用户用 --output 指定的目录)。
+rm -rf "${OUTPUT_DIR}/lib"
+rm -f  "${OUTPUT_DIR}/${EXT_NEW_NAME}.duckdb_extension" "${OUTPUT_DIR}/USAGE.md"
 
 EXT_FILE="$(find "${PG_SRC_DIR}/build/${BUILD_TYPE}" -name "${EXT_NEW_NAME}.duckdb_extension" 2>/dev/null | head -n1 || true)"
 [[ -n "${EXT_FILE}" && -f "${EXT_FILE}" ]] || die "未找到构建产物 ${EXT_NEW_NAME}.duckdb_extension"

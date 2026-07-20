@@ -3,12 +3,15 @@
 基于 [duckdb-postgres](https://github.com/duckdb/postgres_scanner)(postgres_scanner) 构建面向
 **openGauss 家族**(openGauss / MogDB / VastBase / PanWeiDB / GaussDB) 的 DuckDB 可加载扩展。
 
-相比原版 postgres_scanner，本扩展解决两个关键差异：
+相比原版 postgres_scanner，本扩展解决三个关键差异：
 
 - **免手动 SET 协议**：openGauss 的 COPY 二进制流与标准 PostgreSQL 不完全兼容。扩展默认启用
-  TEXT 协议(`pg_use_text_protocol=true`)，无需每次连接后手动 `SET`。
+  TEXT 协议(`opengauss_use_text_protocol=true`)，无需每次连接后手动 `SET`。
 - **原生 sha256 认证**：openGauss 家族默认口令加密为 sha256。原版需把服务端降级为 md5 才能连接；
   本扩展链接 openGauss 自带的 libpq，**直接支持 sha256，无需安全降级**。
+- **可与官方 postgres_scanner 共存**：所有对外标识符全量改名为 `opengauss` 前缀(TYPE `opengauss`、
+  `opengauss_*` 函数、secret 类型 `opengauss`)，与官方 `postgres_scanner` 完全不重叠，可在同一
+  DuckDB 实例内同时加载、分别连接原生 PostgreSQL 与 openGauss/GaussDB。
 
 ---
 
@@ -55,7 +58,7 @@ git submodule update --init --recursive
 
 ## 三、libpq 目录结构
 
-### 下载 openGauss libpq
+### 下载 openGauss libpq()
 
 官方预编译 libpq 下载(按 CPU 架构选择)：
 
@@ -90,6 +93,7 @@ libpq/
     └── lib*_gauss.so*      # openGauss 专属 krb5 / gss / com_err 等
 ```
 
+如果连接华为GaussDB,建议使用华为官方提供的GaussDB的libpq，连接其他openGauss发行版也均建议使用发行厂家单独提供的libpq
 ---
 
 ## 四、使用方法
@@ -137,8 +141,13 @@ libpq/
    - `Makefile` / `extension_config.cmake` / `CMakeLists.txt`：扩展改名为 `opengauss_scanner`
    - `CMakeLists.txt`：绕过 `find_package(PostgreSQL)`，改指向 openGauss libpq；注入
      `--disable-new-dtags`(老式 DT_RPATH 以传递给二级依赖) 与 `$ORIGIN/lib` rpath
-   - `postgres_extension.cpp`：`pg_use_text_protocol` 默认 `false→true`；扩展入口宏改名
-     (使入口符号变为 `opengauss_scanner_duckdb_cpp_init`)
+   - `postgres_extension.cpp`：`opengauss_use_text_protocol` 默认 `false→true`；扩展入口宏改名
+     (使入口符号变为 `opengauss_scanner_duckdb_cpp_init`)；secret 类型/函数、存储扩展键、
+     per-connection state 键均改为独立命名
+   - **全量重命名(与官方 postgres_scanner 同实例共存)**：所有对外函数 `postgres_*`/`pg_*` →
+     `opengauss_*`(scan/scan_pushdown/query/attach/execute/binary/configure_pool/hstore_* 等)，
+     TYPE `postgres_scanner`→`opengauss`，secret 类型 `postgres`/`rds`→`opengauss`/`opengauss_rds`，
+     开关 `pg_use_text_protocol`→`opengauss_use_text_protocol`，并同步内部按名调用/判断处
    - `postgres_oauth.cpp`：替换为 no-op 桩(openGauss libpq 无新版 OAuth API)
    - `postgres_catalog.cpp` / `postgres_secret_storage.cpp`：`return x` → `return std::move(x)`
      (GCC11 + C++17 具名局部返回值隐式移动兼容)
@@ -173,12 +182,22 @@ dist/
 -- 未签名扩展需 CLI 加 -unsigned 启动，或启动时开启 allow_unsigned_extensions
 LOAD 'dist/opengauss_scanner.duckdb_extension';
 
--- 连接 openGauss 家族数据库(sha256 认证，无需 md5 降级)
-ATTACH 'host=127.0.0.1 port=5432 dbname=postgres user=xxx password=xxx' AS og (TYPE postgres);
+-- 连接 openGauss 家族数据库(sha256 认证，无需 md5 降级)。
+-- 注意: 本扩展已全量改名，ATTACH 使用 TYPE opengauss(不再是 TYPE postgres)。
+ATTACH 'host=127.0.0.1 port=5432 dbname=postgres user=xxx password=xxx' AS og (TYPE opengauss);
 
--- 默认已启用 TEXT 协议，直接查询即可
+-- 默认已启用 TEXT 协议(opengauss_use_text_protocol=true)，直接查询即可
 SELECT * FROM og.public.your_table LIMIT 10;
+
+-- 透传 SQL 到远端执行, 用 opengauss_query(对应官方的 postgres_query)
+SELECT * FROM opengauss_query('og', 'SELECT version()');
 ```
+
+> 🔀 **与官方 postgres_scanner 同实例共存**：本扩展的所有对外标识符都改成了 `opengauss` 前缀
+> (TYPE `opengauss`、函数 `opengauss_query`/`opengauss_scan`/`opengauss_attach`/…、secret 类型
+> `opengauss`、开关 `opengauss_use_text_protocol`)，与官方 `postgres_scanner`(TYPE `postgres`、
+> `postgres_*`)完全不重叠。因此可在**同一个 DuckDB 实例**里同时 `LOAD` 两者，分别 `ATTACH` 原生
+> PostgreSQL(`TYPE postgres`)与 openGauss/GaussDB(`TYPE opengauss`)，互不干扰。
 
 ---
 
@@ -216,19 +235,25 @@ SELECT * FROM og.public.your_table LIMIT 10;
 DuckDB 版本由 `duckdb-postgres` 子模块内部的 `duckdb` 子模块 checkout 决定，**构建脚本本身不涉及版本选择**。
 切换版本是在运行构建脚本**之前**完成的子模块操作。
 
-### 方式 A(推荐)：切 `duckdb-postgres` 的配套发布 tag
+> **当前默认已钉稳定版**：`duckdb-postgres` 指向提交 `47537a6`(*Bump submodules to 1.5.3*)，
+> 其内部 `duckdb` 子模块为 **v1.5.3**(source id `14eca11bd9`)。因此产物只能被
+> **官方 DuckDB v1.5.3** 加载(见下方"两个必须注意的点")。
 
-postgres_scanner 与 duckdb 成对发布。切到某个 postgres_scanner 发布 tag，其记录的 `duckdb` 子模块
-就是官方验证过、能编译通过的配套版本，三者(源码 / duckdb / extension-ci-tools)自动互相兼容：
+### 方式 A(推荐)：切 `duckdb-postgres` 的稳定版 bump 提交
+
+`duckdb-postgres` 仓库**不打 release tag**(它跟随 duckdb 主线，由 duckdb 每次发版时的 CI 发布)，
+但历史里有明确的 `Bump submodules to X.Y.Z` 提交，其记录的 `duckdb` 子模块就是官方验证过、
+能编译通过的配套稳定版，三者(源码 / duckdb / extension-ci-tools)自动互相兼容：
 
 ```bash
 cd duckdb-postgres
-git fetch --tags
-git checkout v1.3.2                       # 换成目标发布 tag
-git submodule update --init --recursive   # 对齐嵌套子模块
+# 找到目标稳定版的 bump 提交(例: 1.5.3)
+git log --oneline --all --grep="Bump submodules to 1.5.3"
+git checkout 47537a6                      # 换成查到的 bump 提交
+git submodule update --init --recursive   # 对齐嵌套子模块(duckdb 会切到 v1.5.3)
 cd ..
 # 记录父仓库对子模块的新指向
-git add duckdb-postgres && git commit -m "chore: pin duckdb-postgres to v1.3.2"
+git add duckdb-postgres && git commit -m "chore: pin duckdb-postgres to 1.5.3 (duckdb v1.5.3)"
 ```
 
 ### 方式 B：仅手动钉住内部 `duckdb` 子模块版本

@@ -60,7 +60,7 @@ CONNSTR="host=${DB_HOST} port=${DB_PORT} dbname=${DB_NAME} user=${DB_USER} passw
 # 每次 duckdb -c 是独立进程, 需重复加载与挂载前缀。
 # 未签名扩展由 CLI 的 -unsigned 参数放行, 不能运行时 SET allow_unsigned_extensions。
 PRELUDE="LOAD '${EXT}';
-ATTACH '${CONNSTR}' AS og (TYPE postgres);"
+ATTACH '${CONNSTR}' AS og (TYPE opengauss);"
 
 # run_sql "<sql>"  ->  在 stdout 返回查询结果(含 PRELUDE)
 run_sql() {
@@ -97,23 +97,23 @@ info "2. 加载与连接"
 check "LOAD + ATTACH (sha256 认证)" "SELECT 'connected' AS s;" "connected"
 
 info "3. 核心特性"
-check "默认启用 TEXT 协议 (pg_use_text_protocol=true)" \
-	"SELECT current_setting('pg_use_text_protocol');" "true"
+check "默认启用 TEXT 协议 (opengauss_use_text_protocol=true)" \
+	"SELECT current_setting('opengauss_use_text_protocol');" "true"
 
 info "4. openGauss 家族能力探测"
-VER="$(run_sql "SELECT * FROM postgres_query('og','SELECT version()');" | tail -n1)"
+VER="$(run_sql "SELECT * FROM opengauss_query('og','SELECT version()');" | tail -n1)"
 [[ -n "${VER}" && ! "${VER}" =~ [Ee]rror ]] && ok "version() => ${VER}" || bad "无法获取 version(): ${VER}"
-WVN="$(run_sql "SELECT * FROM postgres_query('og','SELECT working_version_num()');" | tail -n1)"
+WVN="$(run_sql "SELECT * FROM opengauss_query('og','SELECT working_version_num()');" | tail -n1)"
 [[ "${WVN}" =~ ^[0-9]+$ ]] && ok "working_version_num() => ${WVN}" || bad "working_version_num() 非预期: ${WVN}"
 
 info "5. 元数据与数据读取"
-NTAB="$(run_sql "SELECT COUNT(*) FROM postgres_query('og','SELECT tablename FROM pg_tables');" | tail -n1)"
+NTAB="$(run_sql "SELECT COUNT(*) FROM opengauss_query('og','SELECT tablename FROM pg_tables');" | tail -n1)"
 [[ "${NTAB}" =~ ^[0-9]+$ && "${NTAB}" -gt 0 ]] && ok "pg_tables 数量 => ${NTAB}" || bad "pg_tables 计数异常: ${NTAB}"
 
-NSCH="$(run_sql "SELECT COUNT(*) FROM postgres_query('og','SELECT schema_name FROM information_schema.schemata');" | tail -n1)"
+NSCH="$(run_sql "SELECT COUNT(*) FROM opengauss_query('og','SELECT schema_name FROM information_schema.schemata');" | tail -n1)"
 [[ "${NSCH}" =~ ^[0-9]+$ && "${NSCH}" -gt 0 ]] && ok "schema 数量 => ${NSCH}" || bad "schema 计数异常: ${NSCH}"
 
-info "6. 原生扫描路径 (非 postgres_query 透传)"
+info "6. 原生扫描路径 (非 opengauss_query 透传)"
 # 直接对 catalog 表发起原生扫描, 验证 TEXT 协议下的行读取
 NATIVE="$(run_sql "SELECT current_database() AS db, count(*) AS n FROM og.information_schema.tables;" | tail -n1)"
 if [[ "${NATIVE}" =~ [0-9] ]]; then

@@ -226,16 +226,29 @@ jobs:
 
       - name: Wait for openGauss
         run: |
-          set -eux
-          for i in $(seq 1 30); do
-            if pg_isready -h 127.0.0.1 -p 5432; then echo "ready"; break; fi
-            sleep 10
+          set -eu
+          # opengauss docker 初始化期间会内部重启一次(先起库→改配置→重启),
+          # pg_isready 可能在重启前的短暂窗口就误报 ready, 随后 CREATE DATABASE
+          # 撞上重启会断连(FATAL: terminating connection due to administrator command)。
+          # 这里改为在容器内用 gsql 真正执行查询, 且要求"连续 5 次"成功(每次间隔 3s),
+          # 以确保已越过初始化重启、服务已稳定接受连接。
+          ok=0
+          for i in $(seq 1 60); do
+            if docker exec opengauss-custom bash -c "su - omm -c 'gsql -d postgres -c \"SELECT 1;\"'" >/dev/null 2>&1; then
+              ok=$((ok+1)); echo "gsql ok #$ok (attempt $i)"
+              [ "$ok" -ge 5 ] && { echo "openGauss stable"; break; }
+            else
+              ok=0; echo "gsql not ready yet (attempt $i)"
+            fi
+            sleep 3
           done
-          pg_isready -h 127.0.0.1 -p 5432
+          [ "$ok" -ge 5 ] || { echo "ERROR: openGauss 未在预期时间内稳定就绪"; exit 1; }
 
       - name: Create test database & data
         run: |
-          set -eux
+          set -euo pipefail
+          # 注意: 用了 gsql | tee 管道, 必须 pipefail 才能让 if 拿到 gsql 的真实退出码
+          #(否则退出码是 tee 的, 恒为 0, 重试会失效)。
           cat > setup.sql <<'SQL'
           CREATE TABLE IF NOT EXISTS t(id int, name text);
           INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c');
@@ -243,8 +256,20 @@ jobs:
           GRANT SELECT ON t TO root;
           SQL
           docker cp setup.sql opengauss-custom:/tmp/setup.sql
-          docker exec opengauss-custom bash -c "su - omm -c 'gsql -d postgres -c \"CREATE DATABASE test;\"'"
-          docker exec opengauss-custom bash -c "su - omm -c 'gsql -d test -f /tmp/setup.sql'"
+          # 即便已尽量等待稳定, 仍对建库/建表整体加重试, 容忍偶发瞬时断连。
+          # CREATE DATABASE IF NOT EXISTS 保证重试幂等; setup.sql 内部已用 IF NOT EXISTS。
+          for i in $(seq 1 10); do
+            if docker exec opengauss-custom bash -c "su - omm -c 'gsql -d postgres -c \"CREATE DATABASE test;\"'" 2>&1 | tee /tmp/cdb.log \
+               && docker exec opengauss-custom bash -c "su - omm -c 'gsql -d test -f /tmp/setup.sql'" 2>&1 | tee /tmp/setup.log; then
+              echo "db setup ok (attempt $i)"; break
+            fi
+            # 数据库已存在视为成功(重试导致的幂等结果)
+            if grep -q 'already exists' /tmp/cdb.log; then
+              docker exec opengauss-custom bash -c "su - omm -c 'gsql -d test -f /tmp/setup.sql'" && { echo "db exists, setup ok (attempt $i)"; break; }
+            fi
+            echo "db setup failed, retry $i ..."; sleep 5
+            [ "$i" -eq 10 ] && { echo "ERROR: 建库/建表在多次重试后仍失败"; exit 1; }
+          done
 
       - name: Smoke test (LOAD + ATTACH + query)
         run: |

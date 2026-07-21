@@ -2,19 +2,29 @@ name: Build & Release
 
 # 按 DuckDB 官方构建方案(manylinux_2_28 容器: gcc-toolset / glibc 2.28)在
 # linux_amd64 与 linux_arm64 两个平台上, 分别为 openGauss 与 GaussDB 两种 libpq
-# 各构建一个可分发压缩包, 共 4 个:
-#   opengauss_scanner-opengauss-linux_amd64.zip
-#   opengauss_scanner-opengauss-linux_arm64.zip
-#   opengauss_scanner-gaussdb-linux_amd64.zip
-#   opengauss_scanner-gaussdb-linux_arm64.zip
+# 构建可分发压缩包。产物名带上目标 DuckDB 版本, 形如:
+#   opengauss_scanner-<variant>-<platform>-<duckdb_version>.zip
+#   例: opengauss_scanner-gaussdb-linux_amd64-v1.5.4.zip
+# 要编译哪些 DuckDB 版本由仓库根的 duckdb_versions.json 决定(唯一事实源)。
 # 并在 linux_amd64 上用 openGauss docker 做加载/连接冒烟测试; 打 tag(v*) 时发 Release。
-
+#
+# 触发方式(不在普通 push/PR 上自动构建, 完全手动控制何时编译):
+#   - workflow_dispatch: 手动选 all(清单全部) / default(清单默认版) / 指定版本
+#   - push tag v*:        发布, 构建清单里全部版本并挂到 Release
 on:
   push:
-    branches: ["*"]
     tags: ["v*"]
-  pull_request:
   workflow_dispatch:
+    inputs:
+      duckdb_version:
+        description: "构建哪个 DuckDB 版本(需已在 duckdb_versions.json 登记)"
+        type: choice
+        default: all
+        options:
+          - all
+          - default
+          - v1.5.4
+          - v1.5.3
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -22,15 +32,58 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 构建: 2 variant × 2 platform = 4 个产物
+  # 解析要构建的 DuckDB 版本清单(唯一事实源: 仓库根 duckdb_versions.json)。
+  # 输出 matrix=[{version, postgres_ref}, ...] 供 build/test 做动态 matrix。
+  #   - 手动触发: 按 inputs.duckdb_version (all / default / 指定版本)
+  #   - 打 tag 发布: inputs 为空 → 视为 all, 构建全部登记版本
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: prepare (resolve duckdb versions)
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+      - name: Resolve versions from duckdb_versions.json
+        id: resolve
+        env:
+          SEL: ${{ github.event.inputs.duckdb_version || 'all' }}
+        run: |
+          set -eu
+          python3 - "$SEL" <<'PY' >> "$GITHUB_OUTPUT"
+          import json, sys
+          sel = sys.argv[1] if len(sys.argv) > 1 else "all"
+          with open("duckdb_versions.json") as f:
+              m = json.load(f)
+          versions, default = m["versions"], m["default"]
+          if sel == "all":
+              picked = list(versions.keys())
+          elif sel == "default":
+              picked = [default]
+          elif sel in versions:
+              picked = [sel]
+          else:
+              sys.exit(f"未知 DuckDB 版本 '{sel}': 请先在 duckdb_versions.json 登记")
+          arr = [{"version": v, "postgres_ref": versions[v]} for v in picked]
+          print("matrix=" + json.dumps(arr))
+          PY
+          echo "resolved: $(tail -n1 "$GITHUB_OUTPUT")"
+
+  # ---------------------------------------------------------------------------
+  # 构建: (清单版本数) × 2 variant × 2 platform 个产物
   # ---------------------------------------------------------------------------
   build:
-    name: build-${{ matrix.variant }}-${{ matrix.platform }}
+    name: build-${{ matrix.dv.version }}-${{ matrix.variant }}-${{ matrix.platform }}
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.image }}
     strategy:
       fail-fast: false
       matrix:
+        dv: ${{ fromJSON(needs.prepare.outputs.matrix) }}
         variant: [opengauss, gaussdb]
         platform: [linux_amd64, linux_arm64]
         include:
@@ -64,6 +117,20 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 1
+
+      # 把 duckdb-postgres 切到清单登记的 commit(它钉死配套的 duckdb / extension-ci-tools),
+      # 再递归同步嵌套子模块 —— "指定 DuckDB 版本号" 即由此决定实际编译哪个 DuckDB。
+      - name: Select DuckDB version → ${{ matrix.dv.version }}
+        env:
+          PG_REF: ${{ matrix.dv.postgres_ref }}
+        run: |
+          set -eux
+          cd duckdb-postgres
+          git fetch --depth 1 origin "$PG_REF"
+          git checkout -f --detach "$PG_REF"
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth 1
+          echo "duckdb submodule now at: $(git -C duckdb describe --tags 2>/dev/null || git -C duckdb rev-parse --short HEAD)"
 
       # -----------------------------------------------------------------------
       # 准备 libpq: openGauss 用官方预编译包; GaussDB 用华为驱动包里的 Kylin 版
@@ -133,6 +200,10 @@ jobs:
       # 构建扩展 (复用仓库的 build_opengauss_scanner.sh, 官方 ninja 生成器)
       # -----------------------------------------------------------------------
       - name: Build extension
+        env:
+          # 版本戳: 让扩展元数据里的 DuckDB 版本 = 目标版本, 与官方预编译 CLI 精确匹配。
+          # 不设则浅克隆无 tag 会回落成占位版本 v0.0.1, 导致在官方 DuckDB 上 LOAD 被拒。
+          OVERRIDE_GIT_DESCRIBE: ${{ matrix.dv.version }}
         run: |
           set -eux
           chmod +x build_opengauss_scanner.sh
@@ -144,19 +215,15 @@ jobs:
           ls -R dist
           readelf -d dist/opengauss_scanner.duckdb_extension | grep -E 'RPATH|RUNPATH' || true
 
-      - name: Package
-        id: pkg
-        run: |
-          set -eux
-          PKG="opengauss_scanner-${{ matrix.variant }}-${{ matrix.platform }}"
-          ( cd dist && zip -r "../${PKG}.zip" . )
-          echo "pkg=${PKG}" >> "$GITHUB_OUTPUT"
-
+      # 不手动 zip: actions/upload-artifact 下载时本身会再打一层 zip。若这里先
+      # zip 成同名文件再上传, 下载得到的会是"同名 zip 套同名 zip"(双重压缩)。
+      # 直接上传 dist/ 目录内容, 让 GitHub 只压一层 —— 下载
+      # opengauss_scanner-<variant>-<platform>.zip 解开即是 扩展本体 + lib/ + USAGE.md。
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.pkg.outputs.pkg }}
-          path: ${{ steps.pkg.outputs.pkg }}.zip
+          name: opengauss_scanner-${{ matrix.variant }}-${{ matrix.platform }}-${{ matrix.dv.version }}
+          path: dist
           if-no-files-found: error
 
       # 冒烟测试需要一个版本完全匹配的 DuckDB CLI —— 直接用本次构建同时产出的那个,
@@ -173,7 +240,7 @@ jobs:
         if: matrix.platform == 'linux_amd64'
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-cli-${{ matrix.variant }}-linux_amd64
+          name: duckdb-cli-${{ matrix.variant }}-linux_amd64-${{ matrix.dv.version }}
           path: duckdb
           if-no-files-found: error
 
@@ -182,12 +249,13 @@ jobs:
   # (GaussDB 版的扩展链接 GaussDB libpq, 同样以 sha256 连接 openGauss 服务端)
   # ---------------------------------------------------------------------------
   test:
-    name: test-${{ matrix.variant }}-linux_amd64
-    needs: build
+    name: test-${{ matrix.dv.version }}-${{ matrix.variant }}-linux_amd64
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        dv: ${{ fromJSON(needs.prepare.outputs.matrix) }}
         variant: [opengauss, gaussdb]
     services:
       opengauss:
@@ -204,22 +272,23 @@ jobs:
       - name: Download package
         uses: actions/download-artifact@v4
         with:
-          name: opengauss_scanner-${{ matrix.variant }}-linux_amd64
+          name: opengauss_scanner-${{ matrix.variant }}-linux_amd64-${{ matrix.dv.version }}
           path: dl
 
       - name: Download DuckDB CLI
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-${{ matrix.variant }}-linux_amd64
+          name: duckdb-cli-${{ matrix.variant }}-linux_amd64-${{ matrix.dv.version }}
           path: dl-cli
 
       - name: Unpack
         run: |
           set -eux
           sudo apt-get update -qq
-          sudo apt-get install -y unzip postgresql-client
+          sudo apt-get install -y postgresql-client
+          # artifact 现在直接是 dist/ 目录内容(扩展本体 + lib/), 无内层 zip
           mkdir -p dist
-          unzip -o "dl/opengauss_scanner-${{ matrix.variant }}-linux_amd64.zip" -d dist
+          cp -a dl/. dist/
           cp dl-cli/duckdb ./duckdb
           chmod +x ./duckdb
           ls -R dist
@@ -300,12 +369,23 @@ jobs:
           pattern: opengauss_scanner-*
           path: artifacts
 
-      - name: List
-        run: find artifacts -type f -name '*.zip'
+      # 每个 artifact 下载为一个目录(artifacts/opengauss_scanner-<v>-<p>/, 内含
+      # 扩展本体 + lib/)。这里把每个目录打成"单层"zip 再挂到 Release, 保证用户
+      # 下载解开即用, 不出现双重压缩。
+      - name: Repack artifacts into release zips
+        run: |
+          set -eux
+          mkdir -p release
+          for d in artifacts/opengauss_scanner-*; do
+            [ -d "$d" ] || continue
+            name="$(basename "$d")"
+            ( cd "$d" && zip -r "$GITHUB_WORKSPACE/release/${name}.zip" . )
+          done
+          ls -l release
 
       - name: Create / update release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*.zip
+          files: release/*.zip
           fail_on_unmatched_files: true
           generate_release_notes: true

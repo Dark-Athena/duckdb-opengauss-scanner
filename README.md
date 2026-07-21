@@ -200,6 +200,10 @@ SELECT * FROM opengauss_query('og', 'SELECT version()');
 > `postgres_*`)完全不重叠。因此可在**同一个 DuckDB 实例**里同时 `LOAD` 两者，分别 `ATTACH` 原生
 > PostgreSQL(`TYPE postgres`)与 openGauss/GaussDB(`TYPE opengauss`)，互不干扰。
 
+> 📦 **各语言客户端示例**：CLI / Python / C / Node.js / ODBC / R / Rust / Java 如何"开启允许未签名扩展
+> → `LOAD` → `ATTACH` 查询"的可运行 demo，见 [`demos/`](demos/README.md)。关键点：`allow_unsigned_extensions`
+> 是启动期设置，必须在建连/建库那一刻通过 config/连接属性/`-unsigned` 给出，连上后再 `SET` 会报错。
+
 ---
 
 ## 八、功能自测
@@ -233,50 +237,77 @@ SELECT * FROM opengauss_query('og', 'SELECT version()');
 
 ## 十、指定 DuckDB 版本构建
 
-DuckDB 版本由 `duckdb-postgres` 子模块内部的 `duckdb` 子模块 checkout 决定，**构建脚本本身不涉及版本选择**。
-切换版本是在运行构建脚本**之前**完成的子模块操作。
+要编译哪个/哪些 DuckDB 版本, 由仓库根的 **`duckdb_versions.json`** 决定 —— 这是**唯一事实源**。
 
-> **当前默认已钉稳定版**：`duckdb-postgres` 指向提交 `47537a6`(*Bump submodules to 1.5.3*)，
-> 其内部 `duckdb` 子模块为 **v1.5.3**(source id `14eca11bd9`)。因此产物只能被
-> **官方 DuckDB v1.5.3** 加载(见下方"两个必须注意的点")。
+```jsonc
+{
+  "default": "v1.5.4",                 // 未指定版本时的默认(普通/本地构建)
+  "versions": {
+    // DuckDB 版本 tag  ->  duckdb-postgres 的完整 commit SHA
+    // 该 commit 钉死了配套的 duckdb 与 extension-ci-tools, 三者互相兼容
+    "v1.5.4": "0642861a90bc9dcfac12f8ad8dff8a1715883297",
+    "v1.5.3": "47537a627779a78b92d9857effce28d63f1fd8da"
+  }
+}
+```
 
-### 方式 A(推荐)：切 `duckdb-postgres` 的稳定版 bump 提交
+> **为什么用 commit SHA 而不是分支/版本号**:`duckdb-postgres` 不打 release tag, 其源码必须与目标
+> duckdb 版本配套。历史里的 `Bump submodules to X.Y.Z` 提交记录了官方验证过、能编译通过的配套
+> 组合。用**完整 SHA**钉死可复现(发布分支 tip 以后会漂到下一个补丁版)。
 
-`duckdb-postgres` 仓库**不打 release tag**(它跟随 duckdb 主线，由 duckdb 每次发版时的 CI 发布)，
-但历史里有明确的 `Bump submodules to X.Y.Z` 提交，其记录的 `duckdb` 子模块就是官方验证过、
-能编译通过的配套稳定版，三者(源码 / duckdb / extension-ci-tools)自动互相兼容：
+### 在 CI 里构建指定版本(推荐)
+
+到 GitHub Actions 手动运行 **Build & Release**(`workflow_dispatch`), 选 `duckdb_version`:
+
+- `all` —— 构建清单里**全部**版本(打 `v*` tag 发布时也是这个行为)
+- `default` —— 只构建清单 `default` 指定的版本
+- 指定版本(如 `v1.5.4`)—— 只构建该版本
+
+CI 会据此把 `duckdb-postgres` 切到对应 commit、递归同步子模块、并以 `OVERRIDE_GIT_DESCRIBE=<版本>`
+把扩展**正确戳成该 DuckDB 版本**, 产物名带版本号(见[第十二节](#十二github-actions-自动化构建与发布))。
+
+### 新增一个 DuckDB 版本(维护步骤)
 
 ```bash
 cd duckdb-postgres
-# 找到目标稳定版的 bump 提交(例: 1.5.3)
-git log --oneline --all --grep="Bump submodules to 1.5.3"
-git checkout 47537a6                      # 换成查到的 bump 提交
-git submodule update --init --recursive   # 对齐嵌套子模块(duckdb 会切到 v1.5.3)
-cd ..
-# 记录父仓库对子模块的新指向
-git add duckdb-postgres && git commit -m "chore: pin duckdb-postgres to 1.5.3 (duckdb v1.5.3)"
+git fetch origin
+# 1) 在发布分支(如 v1.5-variegata)找到目标版本的 bump 提交, 取其完整 SHA
+git log --oneline origin/v1.5-variegata | grep -i "Bump submodules to 1.5.5"
+git rev-parse <查到的短SHA>            # -> 完整 40 位 SHA
 ```
 
-### 方式 B：仅手动钉住内部 `duckdb` 子模块版本
+然后改两处(仅这两处):
 
-在当前 `duckdb-postgres` 基础上只换 duckdb 版本：
+1. `duckdb_versions.json` 的 `versions` 里加一行:`"v1.5.5": "<完整SHA>"`(需要的话改 `default`)。
+2. `.github/workflows/build.yml` 里 `workflow_dispatch.inputs.duckdb_version.options` 加一项 `v1.5.5`
+   (仅为下拉菜单便利;实际解析以清单为准)。
+
+> 跨**大版本**(如 1.5 → 1.6)时, 我们对 `duckdb-postgres` 打的 rebrand/sha256/TEXT 补丁锚点可能
+> 变化, 首次构建需留意补丁是否踩空。补丁点集中在 `Makefile` / `extension_config.cmake` /
+> `CMakeLists.txt` 及少数 `src/*.cpp`。
+
+### 本地构建指定版本
+
+本地切到目标 `duckdb-postgres` commit 后照常运行构建脚本即可 —— 脚本会**自动**从 `duckdb` 子模块的
+`git describe --tags` 推导版本戳(本地有 tag), 无需手动设 `OVERRIDE_GIT_DESCRIBE`:
 
 ```bash
-cd duckdb-postgres/duckdb
-git fetch --tags
-git checkout v1.5.4                       # 目标 duckdb 版本
-cd ../.. && git submodule update --init --recursive
+cd duckdb-postgres
+git checkout <目标版本对应的 commit SHA>   # 见上方清单
+git submodule update --init --recursive    # 对齐嵌套 duckdb / extension-ci-tools
+cd ..
+rm -rf duckdb-postgres/build dist          # 切版本后务必清理旧产物
+./build_opengauss_scanner.sh --ninja
+# 如需强制指定: OVERRIDE_GIT_DESCRIBE=v1.5.4 ./build_opengauss_scanner.sh ...
 ```
-
-> ⚠️ 若 `duckdb-postgres` 源码引用了目标 duckdb 中不存在的 API，会**编译失败**。跨大版本请优先用方式 A。
 
 ### 两个必须注意的点
 
-1. **加载扩展的 DuckDB 必须版本一致**：可加载扩展的元数据绑定了构建时的 duckdb 版本，版本不符
-   `LOAD` 会被拒(`... was built for DuckDB version 'vX' ...`)。最省事的做法是**用构建同时产出的
-   CLI** `duckdb-postgres/build/release/duckdb`(即本次子模块的版本，天然匹配，测试脚本默认就用它)；
-   若用外部 duckdb 需下载同一版本。
-2. **切换版本后清理旧产物再编译**：`rm -rf duckdb-postgres/build dist`。
+1. **加载扩展的 DuckDB 必须版本一致**:扩展元数据绑定了构建时的 duckdb 版本, 版本不符 `LOAD`
+   会被拒(`... was built for DuckDB version 'vX' ...`;若戳成 `v0.0.1` 则说明版本戳未生效)。
+   最省事是**用构建同时产出的 CLI** `duckdb-postgres/build/release/duckdb`(天然匹配, 测试脚本默认
+   就用它);用外部 duckdb 需下载**同一版本**。
+2. **切换版本后清理旧产物再编译**:`rm -rf duckdb-postgres/build dist`。
 
 ---
 
@@ -334,15 +365,17 @@ cd ../.. && git submodule update --init --recursive
 
 仓库内置 `.github/workflows/build.yml`,**按 DuckDB 官方构建方案**(在
 `quay.io/pypa/manylinux_2_28_{x86_64,aarch64}` 容器内, gcc-toolset / glibc 2.28)自动产出
-**4 个可分发压缩包**:
+可分发压缩包。产物 = **(清单里选中的 DuckDB 版本数) × 2 variant × 2 platform**, 命名带版本号
+`opengauss_scanner-<variant>-<platform>-<duckdb_version>.zip`:
 
-| variant | platform | 压缩包 | 使用的 libpq |
+| variant | platform | 压缩包(以 v1.5.4 为例) | 使用的 libpq |
 |---|---|---|---|
-| openGauss | linux_amd64 | `opengauss_scanner-opengauss-linux_amd64.zip` | openGauss 官方预编译 libpq(x86_64) |
-| openGauss | linux_arm64 | `opengauss_scanner-opengauss-linux_arm64.zip` | openGauss 官方预编译 libpq(aarch64) |
-| GaussDB | linux_amd64 | `opengauss_scanner-gaussdb-linux_amd64.zip` | 华为 GaussDB 驱动包 **Kylin V10 / X86_64** 版 libpq |
-| GaussDB | linux_arm64 | `opengauss_scanner-gaussdb-linux_arm64.zip` | 华为 GaussDB 驱动包 **Kylin V10 / arm_64** 版 libpq |
+| openGauss | linux_amd64 | `opengauss_scanner-opengauss-linux_amd64-v1.5.4.zip` | openGauss 官方预编译 libpq(x86_64) |
+| openGauss | linux_arm64 | `opengauss_scanner-opengauss-linux_arm64-v1.5.4.zip` | openGauss 官方预编译 libpq(aarch64) |
+| GaussDB | linux_amd64 | `opengauss_scanner-gaussdb-linux_amd64-v1.5.4.zip` | 华为 GaussDB 驱动包 **Kylin V10 / X86_64** 版 libpq |
+| GaussDB | linux_arm64 | `opengauss_scanner-gaussdb-linux_arm64-v1.5.4.zip` | 华为 GaussDB 驱动包 **Kylin V10 / arm_64** 版 libpq |
 
+- **构建哪些 DuckDB 版本**:由 `duckdb_versions.json` + 触发时的选择决定(见[第十节](#十指定-duckdb-版本构建))。
 - **openGauss libpq**:直接下载[第三节](#三libpq-目录结构)给出的官方 tar.gz。
 - **GaussDB libpq**:参照华为
   [install_gaussdb_driver.sh](https://github.com/huaweicloud-samples/database-gaussdb-python/blob/master/tools/install_gaussdb_driver.sh)
@@ -352,9 +385,12 @@ cd ../.. && git submodule update --init --recursive
   (`opengauss/opengauss-server:latest`),用**本次同版本产出的 DuckDB CLI** 做
   `LOAD` + `ATTACH (TYPE opengauss)` + 查询的冒烟测试(两种 variant 都测:GaussDB 版扩展同样以
   sha256 连接 openGauss 服务端)。
-- **发布**:推送 `v*` tag 时,自动把 4 个压缩包挂到 GitHub Release。
+- **发布**:推送 `v*` tag 时,自动构建清单里**全部**版本并把压缩包挂到 GitHub Release。
 
-触发方式:push / pull_request / 手动(`workflow_dispatch`)/ 打 `v*` tag(额外触发发布)。
+触发方式(**普通 push / PR 不再自动构建**, 完全手动控制何时编译):
+
+- **`workflow_dispatch`**(手动):选 `duckdb_version` = `all` / `default` / 指定版本。
+- **打 `v*` tag**:构建清单全部版本并发布 Release。
 
 > arm64 构建在 GitHub 托管的 `ubuntu-24.04-arm` 原生 runner 上进行(非 QEMU 模拟);
 > 自动测试仅在 amd64 执行,arm64 为纯构建。

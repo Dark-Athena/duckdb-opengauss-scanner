@@ -16,3 +16,4 @@ og_conn_test
 *.o
 *.swp
 .DS_Store
+/tmp

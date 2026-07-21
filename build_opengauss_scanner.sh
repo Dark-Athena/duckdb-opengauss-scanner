@@ -409,6 +409,16 @@ export VCPKG_TOOLCHAIN_PATH=""
 # CMAKE_BUILD_PARALLEL_LEVEL(CMake>=3.12) 会被 cmake --build 读取并传给底层
 # make/ninja —— 对两种生成器都生效, 无 ninja 时也能真正并行。
 export CMAKE_BUILD_PARALLEL_LEVEL="${JOBS}"
+
+# 版本戳: 扩展元数据里的 DuckDB 版本必须与目标 DuckDB 精确匹配, 否则 LOAD 会报
+# "built for version vX ... can only be loaded with that version"。CI 会显式传入
+# OVERRIDE_GIT_DESCRIBE; 本地未传时从 duckdb 子模块的 git tag 自动推导并导出, 避免
+# 浅克隆/无 tag 时 DuckDB 回落成占位版本 v0.0.1。
+if [[ -z "${OVERRIDE_GIT_DESCRIBE:-}" ]]; then
+	_dv="$(git -C "${PG_SRC_DIR}/duckdb" describe --tags 2>/dev/null || true)"
+	[[ -n "${_dv}" ]] && export OVERRIDE_GIT_DESCRIBE="${_dv}"
+fi
+[[ -n "${OVERRIDE_GIT_DESCRIBE:-}" ]] && log "DuckDB 版本戳 OVERRIDE_GIT_DESCRIBE=${OVERRIDE_GIT_DESCRIBE}" || warn "未能确定 DuckDB 版本戳(OVERRIDE_GIT_DESCRIBE 为空), 产物可能被戳成 v0.0.1"
 EXT_FLAGS="-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON"
 GEN_FLAG=""
 [[ ${GEN_NINJA} -eq 1 ]] && GEN_FLAG="GEN=ninja"
@@ -514,16 +524,28 @@ DuckDB 的语言(Java/C/Python/CLI)及当前工作目录无关。请将扩展与
 不要拆散(扩展与 lib/ 的相对位置必须保持)。
 
 ## 加载(未签名扩展)
+本扩展未签名。allow_unsigned_extensions 是**启动期设置**，数据库运行后再执行
+\`SET allow_unsigned_extensions=true;\` 会报错，必须在**启动/建连那一刻**开启:
+
+- CLI: 启动时加 -unsigned
+\`\`\`bash
+duckdb -unsigned
+\`\`\`
+- 应用/客户端: 建连时在 config/连接属性里给 allow_unsigned_extensions=true
+    - Python:  duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    - JDBC:    连接属性 allow_unsigned_extensions=true
+    - Node.js: new duckdb.Database(':memory:', { allow_unsigned_extensions: 'true' })
+
+开启后再加载扩展:
 \`\`\`sql
-SET allow_unsigned_extensions=true;
 LOAD '${OUTPUT_DIR}/${EXT_NEW_NAME}.duckdb_extension';
 \`\`\`
 
 ## 连接 openGauss 家族数据库
-默认已启用 TEXT 协议(pg_use_text_protocol=true)，无需手动 SET；
+默认已启用 TEXT 协议(opengauss_use_text_protocol=true)，无需手动 SET；
 认证由 openGauss libpq 原生支持 sha256，无需将服务端改为 md5。
 \`\`\`sql
-ATTACH 'host=127.0.0.1 port=5432 dbname=postgres user=xxx password=xxx' AS og (TYPE postgres);
+ATTACH 'host=127.0.0.1 port=5432 dbname=postgres user=xxx password=xxx' AS og (TYPE opengauss);
 SELECT * FROM og.public.your_table LIMIT 10;
 \`\`\`
 EOF

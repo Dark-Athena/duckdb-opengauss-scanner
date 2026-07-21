@@ -6,7 +6,7 @@ name: Build & Release
 #   opengauss_scanner-<variant>-<platform>-<duckdb_version>.zip
 #   例: opengauss_scanner-gaussdb-linux_amd64-v1.5.4.zip
 # 要编译哪些 DuckDB 版本由仓库根的 duckdb_versions.json 决定(唯一事实源)。
-# 并在 linux_amd64 上用 openGauss docker 做加载/连接冒烟测试; 打 tag(v*) 时发 Release。
+# 并在 linux_amd64 与 linux_arm64 上用 openGauss docker 做加载/连接冒烟测试; 打 tag(v*) 时发 Release。
 #
 # 触发方式(不在普通 push/PR 上自动构建, 完全手动控制何时编译):
 #   - workflow_dispatch: 手动选 all(清单全部) / default(清单默认版) / 指定版本
@@ -227,36 +227,41 @@ jobs:
           if-no-files-found: error
 
       # 冒烟测试需要一个版本完全匹配的 DuckDB CLI —— 直接用本次构建同时产出的那个,
-      # 天然与扩展的 duckdb source id 一致。仅 amd64 需要(测试只在 amd64 跑)。
-      - name: Stage matching DuckDB CLI (amd64 only)
-        if: matrix.platform == 'linux_amd64'
+      # 天然与扩展的 duckdb source id 一致。两个平台都产出, 供各自平台的 test 使用。
+      - name: Stage matching DuckDB CLI
         run: |
           set -eux
           CLI="$(find duckdb-postgres/build/release -maxdepth 2 -name duckdb -type f | head -n1)"
           test -n "$CLI"
           cp "$CLI" duckdb
 
-      - name: Upload DuckDB CLI artifact (amd64 only)
-        if: matrix.platform == 'linux_amd64'
+      - name: Upload DuckDB CLI artifact
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-cli-${{ matrix.variant }}-linux_amd64-${{ matrix.dv.version }}
+          name: duckdb-cli-${{ matrix.variant }}-${{ matrix.platform }}-${{ matrix.dv.version }}
           path: duckdb
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # 测试: 在 linux_amd64 上用 openGauss docker 做加载 + 连接 + 查询冒烟测试
+  # 测试: 在 linux_amd64 与 linux_arm64 上用 openGauss docker 做加载 + 连接 + 查询
+  # 冒烟测试(openGauss 官方镜像是 amd64/arm64 多架构, 各自 runner 自动拉对应架构)。
   # (GaussDB 版的扩展链接 GaussDB libpq, 同样以 sha256 连接 openGauss 服务端)
   # ---------------------------------------------------------------------------
   test:
-    name: test-${{ matrix.dv.version }}-${{ matrix.variant }}-linux_amd64
+    name: test-${{ matrix.dv.version }}-${{ matrix.variant }}-${{ matrix.platform }}
     needs: [prepare, build]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         dv: ${{ fromJSON(needs.prepare.outputs.matrix) }}
         variant: [opengauss, gaussdb]
+        platform: [linux_amd64, linux_arm64]
+        include:
+          - platform: linux_amd64
+            runner: ubuntu-latest
+          - platform: linux_arm64
+            runner: ubuntu-24.04-arm
     services:
       opengauss:
         image: opengauss/opengauss-server:latest
@@ -272,13 +277,13 @@ jobs:
       - name: Download package
         uses: actions/download-artifact@v4
         with:
-          name: opengauss_scanner-${{ matrix.variant }}-linux_amd64-${{ matrix.dv.version }}
+          name: opengauss_scanner-${{ matrix.variant }}-${{ matrix.platform }}-${{ matrix.dv.version }}
           path: dl
 
       - name: Download DuckDB CLI
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-${{ matrix.variant }}-linux_amd64-${{ matrix.dv.version }}
+          name: duckdb-cli-${{ matrix.variant }}-${{ matrix.platform }}-${{ matrix.dv.version }}
           path: dl-cli
 
       - name: Unpack

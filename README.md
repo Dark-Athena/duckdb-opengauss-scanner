@@ -380,9 +380,9 @@ rm -rf duckdb-postgres/build dist          # 切版本后务必清理旧产物
 - **GaussDB libpq**:参照华为
   [install_gaussdb_driver.sh](https://github.com/huaweicloud-samples/database-gaussdb-python/blob/master/tools/install_gaussdb_driver.sh)
   的方式下载 `GaussDB_driver.zip`,但**只取 `Centralized/Kylinv10_<ARCH>/` 里的 libpq**。
-- **自动测试**:在 `linux_amd64` 上拉起
+- **自动测试**:在 `linux_amd64` 与 `linux_arm64` 上各自拉起
   [opengauss docker](https://github.com/huaweicloud-samples/database-gaussdb-python/blob/master/.github/workflows/tests.yml)
-  (`opengauss/opengauss-server:latest`),用**本次同版本产出的 DuckDB CLI** 做
+  (`opengauss/opengauss-server:latest` 为 amd64/arm64 多架构镜像, 各 runner 自动拉对应架构),用**本次同版本产出的 DuckDB CLI** 做
   `LOAD` + `ATTACH (TYPE opengauss)` + 查询的冒烟测试(两种 variant 都测:GaussDB 版扩展同样以
   sha256 连接 openGauss 服务端)。
 - **发布**:推送 `v*` tag 时,自动构建清单里**全部**版本并把压缩包挂到 GitHub Release。
@@ -392,7 +392,7 @@ rm -rf duckdb-postgres/build dist          # 切版本后务必清理旧产物
 - **`workflow_dispatch`**(手动):选 `duckdb_version` = `all` / `default` / 指定版本。
 - **打 `v*` tag**:构建清单全部版本并发布 Release。
 
-> arm64 构建在 GitHub 托管的 `ubuntu-24.04-arm` 原生 runner 上进行(非 QEMU 模拟);
-> 自动测试仅在 amd64 执行,arm64 为纯构建。
+> arm64 构建与测试均在 GitHub 托管的 `ubuntu-24.04-arm` 原生 runner 上进行(非 QEMU 模拟),
+> 与 amd64 同等覆盖(构建 + 加载/连接/查询冒烟测试)。
 
 

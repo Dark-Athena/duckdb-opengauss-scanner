@@ -25,6 +25,7 @@ on:
           - default
           - v1.5.4
           - v1.5.3
+          - v1.4.5
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -118,19 +119,13 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      # 把 duckdb-postgres 切到清单登记的 commit(它钉死配套的 duckdb / extension-ci-tools),
-      # 再递归同步嵌套子模块 —— "指定 DuckDB 版本号" 即由此决定实际编译哪个 DuckDB。
+      # 官方口径切换: 把 duckdb-postgres 切到清单登记的 postgres_scanner 官方 pin,
+      # 再把嵌套 duckdb 强制 checkout 到目标版本(等价官方 set_duckdb_version) ——
+      # "指定 DuckDB 版本号" 即由此决定实际编译哪个 DuckDB, 对分支已删的 EOL 版本亦可。
       - name: Select DuckDB version → ${{ matrix.dv.version }}
-        env:
-          PG_REF: ${{ matrix.dv.postgres_ref }}
         run: |
           set -eux
-          cd duckdb-postgres
-          git fetch --depth 1 origin "$PG_REF"
-          git checkout -f --detach "$PG_REF"
-          git submodule sync --recursive
-          git submodule update --init --recursive --depth 1
-          echo "duckdb submodule now at: $(git -C duckdb describe --tags 2>/dev/null || git -C duckdb rev-parse --short HEAD)"
+          bash scripts/select_duckdb.sh "${{ matrix.dv.version }}" "${{ matrix.dv.postgres_ref }}"
 
       # -----------------------------------------------------------------------
       # 准备 libpq: openGauss 用官方预编译包; GaussDB 用华为驱动包里的 Kylin 版

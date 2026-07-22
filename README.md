@@ -243,17 +243,24 @@ SELECT * FROM opengauss_query('og', 'SELECT version()');
 {
   "default": "v1.5.4",                 // 未指定版本时的默认(普通/本地构建)
   "versions": {
-    // DuckDB 版本 tag  ->  duckdb-postgres 的完整 commit SHA
-    // 该 commit 钉死了配套的 duckdb 与 extension-ci-tools, 三者互相兼容
-    "v1.5.4": "0642861a90bc9dcfac12f8ad8dff8a1715883297",
-    "v1.5.3": "47537a627779a78b92d9857effce28d63f1fd8da"
+    // DuckDB 版本 tag  ->  duckdb-postgres 的官方 pin 完整 commit SHA
+    // 该 SHA 取自 duckdb/duckdb 在该版本 tag 冻结的
+    //   .github/config/extensions/postgres_scanner.cmake 的 GIT_TAG
+    // (可用 scripts/resolve_pg_ref.sh <版本> 解析)。
+    "v1.5.4": "8f813f9b9c9e52a9074a050a0be60f49160a6baa",
+    "v1.5.3": "6b2b12cad3afef61e8a4637e714e8a88895fed1a",
+    "v1.4.5": "b9fce43bc5d36bc6db70844f28b7b146e756eb22"
   }
 }
 ```
 
-> **为什么用 commit SHA 而不是分支/版本号**:`duckdb-postgres` 不打 release tag, 其源码必须与目标
-> duckdb 版本配套。历史里的 `Bump submodules to X.Y.Z` 提交记录了官方验证过、能编译通过的配套
-> 组合。用**完整 SHA**钉死可复现(发布分支 tip 以后会漂到下一个补丁版)。
+> **为什么用官方 pin SHA(而不是分支/版本号/Bump 提交)**:`duckdb-postgres` 不打 release tag。
+> 我们统一采用**官方口径** —— 即 `duckdb/duckdb` 主仓库在各版本 tag 里冻结的 `postgres_scanner`
+> 源码 commit。这是对**任何**版本(含分支已被删的 EOL 版本, 如 `v1.4.5`)都通用的权威来源。
+>
+> 注意:官方 pin 自带的**嵌套 `duckdb` 子模块可能滞后**目标版本(例如 v1.5.4 的 pin 内嵌 v1.5.3)。
+> 构建时由 `scripts/select_duckdb.sh` 把嵌套 `duckdb` **强制覆盖**到目标版本 tag —— 等价于官方
+> 发布流程里的 `make set_duckdb_version`。因此"指定 DuckDB 版本"最终决定实际编译哪个 DuckDB。
 
 ### 在 CI 里构建指定版本(推荐)
 
@@ -263,17 +270,17 @@ SELECT * FROM opengauss_query('og', 'SELECT version()');
 - `default` —— 只构建清单 `default` 指定的版本
 - 指定版本(如 `v1.5.4`)—— 只构建该版本
 
-CI 会据此把 `duckdb-postgres` 切到对应 commit、递归同步子模块、并以 `OVERRIDE_GIT_DESCRIBE=<版本>`
-把扩展**正确戳成该 DuckDB 版本**, 产物名带版本号(见[第十二节](#十二github-actions-自动化构建与发布))。
+CI 会调用 `scripts/select_duckdb.sh <版本> <官方pin>` 把 `duckdb-postgres` 切到清单登记的官方 pin、
+把嵌套 `duckdb` 强制覆盖到目标版本, 并以 `OVERRIDE_GIT_DESCRIBE=<版本>` 把扩展**正确戳成该 DuckDB
+版本**, 产物名带版本号(见[第十二节](#十二github-actions-自动化构建与发布))。
 
 ### 新增一个 DuckDB 版本(维护步骤)
 
+用 `scripts/resolve_pg_ref.sh` 解析该版本的官方 pin(读 `duckdb/duckdb` 对应 tag 冻结的
+`postgres_scanner.cmake` 的 `GIT_TAG`, 对 EOL 版本同样适用):
+
 ```bash
-cd duckdb-postgres
-git fetch origin
-# 1) 在发布分支(如 v1.5-variegata)找到目标版本的 bump 提交, 取其完整 SHA
-git log --oneline origin/v1.5-variegata | grep -i "Bump submodules to 1.5.5"
-git rev-parse <查到的短SHA>            # -> 完整 40 位 SHA
+scripts/resolve_pg_ref.sh v1.5.5      # -> stdout 打印完整 40 位 SHA; stderr 打印核对信息
 ```
 
 然后改两处(仅这两处):
@@ -288,17 +295,25 @@ git rev-parse <查到的短SHA>            # -> 完整 40 位 SHA
 
 ### 本地构建指定版本
 
-本地切到目标 `duckdb-postgres` commit 后照常运行构建脚本即可 —— 脚本会**自动**从 `duckdb` 子模块的
-`git describe --tags` 推导版本戳(本地有 tag), 无需手动设 `OVERRIDE_GIT_DESCRIBE`:
+最省事是把版本号直接交给构建脚本 —— 它会调用 `scripts/select_duckdb.sh` 走官方口径切换
+(切到官方 pin + 覆盖嵌套 duckdb 到目标版本), 并自动以该版本作为版本戳:
 
 ```bash
-cd duckdb-postgres
-git checkout <目标版本对应的 commit SHA>   # 见上方清单
-git submodule update --init --recursive    # 对齐嵌套 duckdb / extension-ci-tools
-cd ..
-rm -rf duckdb-postgres/build dist          # 切版本后务必清理旧产物
+rm -rf duckdb-postgres/build dist                        # 切版本前务必清理旧产物
+./build_opengauss_scanner.sh --duckdb-version v1.4.5 --ninja
+```
+
+> `--duckdb-version` 对分支已删的 **EOL 版本(如 `v1.4.5`)同样有效** —— 只要该版本已在
+> `duckdb_versions.json` 登记。省略该参数时, 脚本直接构建 `duckdb-postgres` 的**当前 checkout**,
+> 并从嵌套 `duckdb` 的 `git describe --tags` 自动推导版本戳, 无需手动设 `OVERRIDE_GIT_DESCRIBE`。
+
+也可先单独切换再构建(等价, 便于排查):
+
+```bash
+scripts/select_duckdb.sh v1.4.5      # 官方口径切换(幂等; 已在目标状态则跳过网络操作)
+rm -rf duckdb-postgres/build dist
 ./build_opengauss_scanner.sh --ninja
-# 如需强制指定: OVERRIDE_GIT_DESCRIBE=v1.5.4 ./build_opengauss_scanner.sh ...
+# 如需强制指定版本戳: OVERRIDE_GIT_DESCRIBE=v1.4.5 ./build_opengauss_scanner.sh ...
 ```
 
 ### 两个必须注意的点
@@ -308,6 +323,22 @@ rm -rf duckdb-postgres/build dist          # 切版本后务必清理旧产物
    最省事是**用构建同时产出的 CLI** `duckdb-postgres/build/release/duckdb`(天然匹配, 测试脚本默认
    就用它);用外部 duckdb 需下载**同一版本**。
 2. **切换版本后清理旧产物再编译**:`rm -rf duckdb-postgres/build dist`。
+
+### 1.4.x (LTS) 与 1.5.x 的架构差异
+
+`v1.4.5` 是 DuckDB 官网当前的 **LTS 版本**, 本仓库已完整支持。需要注意 `duckdb-postgres`
+在 1.4.x 与 1.5.x 用了**两套完全不同的 libpq 获取方式**, 构建脚本用**特性探测(feature-probing,
+按锚点/文件存在与否, 而非硬编码版本号)**自动选对补丁, 因此 `--duckdb-version` 对两代都适用:
+
+| | 1.5.x | 1.4.x (LTS) |
+|---|---|---|
+| libpq 来源 | `find_package(PostgreSQL REQUIRED)` 链接预编译 libpq | 下载 PostgreSQL 15.13 源码 + `./configure` 把 PG 官方 libpq 静态编进扩展 |
+| 本仓库补丁 | 替换 `find_package(PostgreSQL)` 为指向 openGauss libpq 的 IMPORTED target | **移除**"下载/编译 PG 源码"逻辑, 改链外部 openGauss libpq(`OPENSSL_USE_STATIC_LIBS` 也随之改 `FALSE`) |
+| secret/storage 注册 | 分散在 `postgres_secrets.cpp` 等, 用 `StorageExtension::Register(...)` | 集中在 `postgres_extension.cpp`, 用 `config.storage_extensions[...]` |
+| 缺失的文件/特性 | 齐全 | 无 `postgres_oauth`/`aws`/`hstore`/`logging`/`configure_pool`/`secret_storage`, 无 `read_postgres_binary`/`RemoteExecute`(相关补丁"存在才打", 自动跳过) |
+
+> 无论哪代, 最终都**只链接外部 openGauss libpq** —— openGauss 家族的 sha256 认证依赖其自带
+> libpq, PostgreSQL 官方 libpq 不识别, 故 1.4.x 也必须移除内嵌的 PG libpq。
 
 ---
 

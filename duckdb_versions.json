@@ -1,8 +1,9 @@
 {
-  "_comment": "DuckDB 版本 → duckdb-postgres commit 的映射(唯一事实源)。key 是 DuckDB 版本 tag(同时用作 OVERRIDE_GIT_DESCRIBE 的值), value 是 duckdb-postgres 的完整 commit SHA —— 该 commit 钉死了配套的 duckdb 与 extension-ci-tools, 且源码与该 DuckDB 版本兼容。新增版本见 README '新增 DuckDB 版本' 一节。",
+  "_comment": "DuckDB 版本 → postgres_scanner(duckdb-postgres) 官方源码 commit 的映射(唯一事实源)。key 是 DuckDB 版本 tag(同时用作 OVERRIDE_GIT_DESCRIBE 的值), value 是 DuckDB 官方在该版本 tag 冻结的 postgres_scanner 源码 commit 完整 SHA(取自 duckdb/duckdb 的 .github/config/extensions/postgres_scanner.cmake 的 GIT_TAG, 可用 scripts/resolve_pg_ref.sh 解析)。注意: 该 commit 自带的嵌套 duckdb 子模块可能滞后, 构建时由 scripts/select_duckdb.sh 用目标版本强制覆盖(等价官方 set_duckdb_version), 因此对分支已删的 EOL 版本(如 v1.4.5)同样可构建。新增版本见 README '新增 DuckDB 版本' 一节。",
   "default": "v1.5.4",
   "versions": {
-    "v1.5.4": "0642861a90bc9dcfac12f8ad8dff8a1715883297",
-    "v1.5.3": "47537a627779a78b92d9857effce28d63f1fd8da"
+    "v1.5.4": "8f813f9b9c9e52a9074a050a0be60f49160a6baa",
+    "v1.5.3": "6b2b12cad3afef61e8a4637e714e8a88895fed1a",
+    "v1.4.5": "b9fce43bc5d36bc6db70844f28b7b146e756eb22"
   }
 }

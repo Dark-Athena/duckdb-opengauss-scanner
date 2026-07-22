@@ -16,7 +16,11 @@
 #
 # 用法:
 #   ./build_opengauss_scanner.sh [--libpq-dir DIR] [--duckdb-postgres DIR]
+#                                [--duckdb-version vX.Y.Z]
 #                                [--output DIR] [--jobs N] [--debug] [--ninja]
+#
+#   --duckdb-version: 官方口径切换到指定 DuckDB 版本(需已在 duckdb_versions.json 登记)
+#                     再构建; 省略时直接构建 duckdb-postgres 当前 checkout。
 #
 set -euo pipefail
 
@@ -32,13 +36,14 @@ EXT_NEW_NAME="opengauss_scanner"
 JOBS="$(nproc 2>/dev/null || echo 4)"
 BUILD_TYPE="release"
 GEN_NINJA=0
+DUCKDB_VERSION=""
 
 log()  { printf '\033[1;32m[og-build]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[og-build][WARN]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[og-build][ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
-	sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+	sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 	exit 0
 }
 
@@ -49,6 +54,7 @@ while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--libpq-dir)        LIBPQ_DIR="$(cd "$2" && pwd)"; shift 2 ;;
 		--duckdb-postgres)  PG_SRC_DIR="$(cd "$2" && pwd)"; shift 2 ;;
+		--duckdb-version)   DUCKDB_VERSION="$2"; shift 2 ;;
 		--output)           OUTPUT_DIR="$2"; shift 2 ;;
 		--jobs|-j)          JOBS="$2"; shift 2 ;;
 		--debug)            BUILD_TYPE="debug"; shift ;;
@@ -57,6 +63,17 @@ while [[ $# -gt 0 ]]; do
 		*) die "未知参数: $1 (用 --help 查看用法)" ;;
 	esac
 done
+
+# 官方口径版本切换(可选): 指定 --duckdb-version 时, 先把 duckdb-postgres 切到该版本的
+# 官方 pin 并把嵌套 duckdb 覆盖到目标版本, 再构建; 省略时构建当前 checkout。
+if [[ -n "${DUCKDB_VERSION}" ]]; then
+	SELECT_SH="${SCRIPT_DIR}/scripts/select_duckdb.sh"
+	[[ -f "${SELECT_SH}" ]] || die "找不到 ${SELECT_SH}"
+	log "切换到 DuckDB 版本: ${DUCKDB_VERSION}"
+	DUCKDB_POSTGRES_DIR="${PG_SRC_DIR}" bash "${SELECT_SH}" "${DUCKDB_VERSION}"
+	# 切换后即以目标版本作为版本戳, 避免依赖 describe 再推导
+	export OVERRIDE_GIT_DESCRIBE="${OVERRIDE_GIT_DESCRIBE:-${DUCKDB_VERSION}}"
+fi
 
 # 输出目录转绝对路径
 mkdir -p "${OUTPUT_DIR}"
@@ -108,6 +125,8 @@ trap restore_sources EXIT INT TERM
 edit_begin() {  # $1 = file (相对 PG_SRC_DIR)
 	local f="${PG_SRC_DIR}/$1"
 	[[ -f "${f}" ]] || die "待修改文件不存在: ${f}"
+	# 幂等: 同一文件被多次 patch 时只备份一次原始版本, 避免 .ogbak 被中间态覆盖。
+	[[ -f "${f}.ogbak" ]] && return 0
 	cp -p "${f}" "${f}.ogbak"
 	BACKED_UP+=("${f}")
 }
@@ -116,8 +135,14 @@ edit_begin() {  # $1 = file (相对 PG_SRC_DIR)
 # 用法: rebrand_replace <相对文件> old1 new1 [old2 new2 ...]
 # 每个 old 必须至少匹配 1 处(否则报错), 用带引号的字面量避免子串误伤
 # (如 "postgres_scan" 不会命中 "postgres_scan_pushdown")。
+# 若文件本身不存在(某些 duckdb 版本无此特性/文件), 整体跳过(告警不报错),
+# 以支持跨版本(如 1.4.x 缺少 aws/hstore/logging/secrets/configure_pool 等文件)。
 rebrand_replace() {
 	local rel="$1"; shift
+	if [[ ! -f "${PG_SRC_DIR}/${rel}" ]]; then
+		warn "跳过重命名(该 duckdb 版本无此文件): ${rel}"
+		return 0
+	fi
 	edit_begin "${rel}"
 	python3 - "${PG_SRC_DIR}/${rel}" "$@" <<'PYEOF'
 import sys, io
@@ -139,6 +164,35 @@ print("[rebrand] %s: %d 处" % (p, total))
 PYEOF
 }
 
+# 同 rebrand_replace, 但每个字面量“存在才替换”(不强制至少 1 处), 文件缺失亦跳过。
+# 用于跨版本才有的可选标识符(如 1.5.x 独有的 read_postgres_binary 读函数)。
+rebrand_replace_opt() {
+	local rel="$1"; shift
+	if [[ ! -f "${PG_SRC_DIR}/${rel}" ]]; then
+		return 0
+	fi
+	edit_begin "${rel}"
+	python3 - "${PG_SRC_DIR}/${rel}" "$@" <<'PYEOF'
+import sys, io
+p = sys.argv[1]
+pairs = sys.argv[2:]
+assert len(pairs) % 2 == 0, "old/new 参数必须成对: " + p
+with io.open(p, encoding="utf-8") as f:
+    s = f.read()
+total = 0
+for i in range(0, len(pairs), 2):
+    old, new = pairs[i], pairs[i + 1]
+    c = s.count(old)
+    if c:
+        s = s.replace(old, new)
+        total += c
+with io.open(p, "w", encoding="utf-8") as f:
+    f.write(s)
+if total:
+    print("[rebrand-opt] %s: %d 处" % (p, total))
+PYEOF
+}
+
 log "== 阶段1: 对源码打临时补丁 =="
 
 # (a) 改名: Makefile EXT_NAME
@@ -155,18 +209,17 @@ edit_begin "CMakeLists.txt"
 CM="${PG_SRC_DIR}/CMakeLists.txt"
 # TARGET_NAME
 sed -i "s/set(TARGET_NAME ${EXT_OLD_NAME})/set(TARGET_NAME ${EXT_NEW_NAME})/" "${CM}"
-# 绕过 find_package(PostgreSQL)，改用指向 openGauss libpq 的 IMPORTED target。
-# 保持后续 \${PostgreSQL_INCLUDE_DIRS} 与 PostgreSQL::PostgreSQL 的用法不变。
+# 绕过官方 libpq 获取方式，改用外部 openGauss libpq。按 duckdb-postgres 架构分两种口径:
+#   - 1.5.x: find_package(PostgreSQL REQUIRED) -> 指向 openGauss libpq 的 IMPORTED target
+#   - 1.4.x: 移除“下载并编译 PG 源码内 libpq”的逻辑, 改链外部 openGauss libpq
+# 保持后续 ${PostgreSQL_INCLUDE_DIRS} 与 PostgreSQL::PostgreSQL 的用法不变。
 python3 - "${CM}" "${LIBPQ_INC}" "${LIBPQ_LINK}" <<'PYEOF'
 import sys, io
 cm, inc, link = sys.argv[1], sys.argv[2], sys.argv[3]
 with io.open(cm, encoding="utf-8") as f:
     s = f.read()
 
-# 1) 替换 find_package(PostgreSQL REQUIRED) 为 openGauss libpq 的 IMPORTED target
-old = "find_package(PostgreSQL REQUIRED)"
-new = (
-    "# [opengauss_scanner] 使用外部 openGauss libpq，绕过 find_package(PostgreSQL)\n"
+IMPORTED_TARGET = (
     "set(PostgreSQL_INCLUDE_DIRS \"{inc}\")\n"
     "set(PostgreSQL_LIBRARIES \"{link}\")\n"
     "if(NOT TARGET PostgreSQL::PostgreSQL)\n"
@@ -176,41 +229,95 @@ new = (
     "    INTERFACE_INCLUDE_DIRECTORIES \"{inc}\")\n"
     "endif()"
 ).format(inc=inc, link=link)
-assert old in s, "CMakeLists.txt 中未找到 find_package(PostgreSQL REQUIRED)"
-s = s.replace(old, new, 1)
 
-# 2a) 强制老式 DT_RPATH(--disable-new-dtags)，使 rpath 可传递到 libpq 的
-#     krb5/gss 二级依赖(DT_RUNPATH 不具备传递性)。
-anchor = '"-Wl,-Bsymbolic"'
-assert anchor in s, "CMakeLists.txt 中未找到 -Wl,-Bsymbolic 锚点"
-s = s.replace(
-    anchor,
-    '"-Wl,-Bsymbolic"\n        "-Wl,--disable-new-dtags"',
-    1,
-)
+if "find_package(PostgreSQL REQUIRED)" in s:
+    # ============================ 1.5.x 架构 ============================
+    # 1) 替换 find_package(PostgreSQL REQUIRED) 为 openGauss libpq 的 IMPORTED target
+    old = "find_package(PostgreSQL REQUIRED)"
+    new = "# [opengauss_scanner] 使用外部 openGauss libpq，绕过 find_package(PostgreSQL)\n" + IMPORTED_TARGET
+    s = s.replace(old, new, 1)
 
-# 2b) rpath=$ORIGIN 通过 CMake 目标属性设置(而非裸链接 flag)，由 CMake 负责
-#     对生成器正确转义 $，避免 make/ninja 把 $ORIGIN 吃成 $。
-#     BUILD_WITH_INSTALL_RPATH=ON 让构建期直接采用 $ORIGIN，并抑制 CMake
-#     自动追加的 libpq 绝对路径 —— 产物只保留可移植的 $ORIGIN。
-marker = "build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})"
-assert marker in s, "CMakeLists.txt 中未找到 build_loadable_extension 调用"
-s = s.replace(
-    marker,
-    marker + "\n\n"
-    "# [opengauss_scanner] 便携 rpath: 扩展从同目录 lib/ 子目录解析 libpq 及其依赖\n"
-    "if(NOT WIN32 AND NOT APPLE)\n"
-    "  set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES\n"
-    "    BUILD_RPATH \"$ORIGIN/lib\"\n"
-    "    INSTALL_RPATH \"$ORIGIN/lib\"\n"
-    "    BUILD_WITH_INSTALL_RPATH ON)\n"
-    "endif()",
-    1,
-)
+    # 2a) 强制老式 DT_RPATH(--disable-new-dtags)，使 rpath 可传递到 libpq 的
+    #     krb5/gss 二级依赖(DT_RUNPATH 不具备传递性)。
+    anchor = '"-Wl,-Bsymbolic"'
+    assert anchor in s, "CMakeLists.txt 中未找到 -Wl,-Bsymbolic 锚点"
+    s = s.replace(anchor, '"-Wl,-Bsymbolic"\n        "-Wl,--disable-new-dtags"', 1)
+
+    # 2b) rpath=$ORIGIN 通过 CMake 目标属性设置(而非裸链接 flag)，由 CMake 负责
+    #     对生成器正确转义 $，避免 make/ninja 把 $ORIGIN 吃成 $。
+    marker = "build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})"
+    assert marker in s, "CMakeLists.txt 中未找到 build_loadable_extension 调用"
+    s = s.replace(
+        marker,
+        marker + "\n\n"
+        "# [opengauss_scanner] 便携 rpath: 扩展从同目录 lib/ 子目录解析 libpq 及其依赖\n"
+        "if(NOT WIN32 AND NOT APPLE)\n"
+        "  set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES\n"
+        "    BUILD_RPATH \"$ORIGIN/lib\"\n"
+        "    INSTALL_RPATH \"$ORIGIN/lib\"\n"
+        "    BUILD_WITH_INSTALL_RPATH ON)\n"
+        "endif()",
+        1,
+    )
+    print("[patch] CMakeLists.txt(1.5.x): 已重定向 libpq 并注入 rpath=$ORIGIN(DT_RPATH)")
+
+elif "LIBPG_SOURCES_FULLPATH" in s:
+    # ============================ 1.4.x 架构 ============================
+    # 该版本原本下载 PostgreSQL 源码并把其 libpq 编进扩展; 改为链接外部 openGauss libpq
+    # (openGauss 家族的 sha256 认证依赖 openGauss 自带 libpq, PG 官方 libpq 不识别)。
+    # a) 在 find_package(OpenSSL REQUIRED) 后注入 openGauss libpq 的 IMPORTED target
+    a = "find_package(OpenSSL REQUIRED)"
+    assert a in s, "1.4.x CMakeLists 未找到 find_package(OpenSSL REQUIRED)"
+    s = s.replace(
+        a,
+        a + "\n\n# [opengauss_scanner] 使用外部 openGauss libpq(不再下载/编译 PG 源码)\n" + IMPORTED_TARGET,
+        1,
+    )
+    # b) OpenSSL 改用动态系统库(内嵌 libpq 已移除, 无需静态 OpenSSL)
+    s = s.replace("set(OPENSSL_USE_STATIC_LIBS TRUE)", "set(OPENSSL_USE_STATIC_LIBS FALSE)", 1)
+    # c) 全局 include 路径加入 openGauss libpq 头(供 src 找到 libpq-fe.h)
+    inc_anchor = "include_directories(include postgres/src/include"
+    assert inc_anchor in s, "1.4.x CMakeLists 未找到 include_directories 锚点"
+    s = s.replace(inc_anchor, "include_directories(include ${PostgreSQL_INCLUDE_DIRS} postgres/src/include", 1)
+    # d) 跳过“下载/编译 PG 源码”逻辑
+    dl_anchor = "if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/postgres)"
+    assert dl_anchor in s, "1.4.x CMakeLists 未找到 PG 源码下载判断"
+    s = s.replace(dl_anchor, "if(FALSE)  # [opengauss_scanner] 跳过下载/编译 PG 源码, 改用外部 openGauss libpq", 1)
+    # e) 从 build_loadable_extension 移除内嵌 libpq 源
+    build_anchor = ("build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES}\n"
+                    "                         ${LIBPG_SOURCES_FULLPATH})")
+    assert build_anchor in s, "1.4.x CMakeLists 未找到 build_loadable_extension 调用"
+    s = s.replace(build_anchor, "build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})", 1)
+    # f) target include 加入 openGauss libpq 头
+    tinc_anchor = "PRIVATE include postgres/src/include postgres/src/backend"
+    assert tinc_anchor in s, "1.4.x CMakeLists 未找到 target_include_directories 锚点"
+    s = s.replace(tinc_anchor, "PRIVATE include ${PostgreSQL_INCLUDE_DIRS} postgres/src/include postgres/src/backend", 1)
+    # g) 链接外部 openGauss libpq + 便携 rpath=$ORIGIN/lib(强制 DT_RPATH 以传递到 krb5/gss)
+    link_anchor = "target_link_libraries(${TARGET_NAME}_loadable_extension ${OPENSSL_LIBRARIES})"
+    assert link_anchor in s, "1.4.x CMakeLists 未找到 target_link_libraries 锚点"
+    s = s.replace(
+        link_anchor,
+        link_anchor + "\n\n"
+        "# [opengauss_scanner] 链接外部 openGauss libpq + 便携 rpath=$ORIGIN/lib\n"
+        "target_link_libraries(${TARGET_NAME}_loadable_extension PostgreSQL::PostgreSQL)\n"
+        "if(NOT WIN32 AND NOT APPLE)\n"
+        "  set_target_properties(${TARGET_NAME}_loadable_extension PROPERTIES\n"
+        "    BUILD_RPATH \"$ORIGIN/lib\"\n"
+        "    INSTALL_RPATH \"$ORIGIN/lib\"\n"
+        "    BUILD_WITH_INSTALL_RPATH ON)\n"
+        "  set_property(TARGET ${TARGET_NAME}_loadable_extension APPEND_STRING PROPERTY\n"
+        "               LINK_FLAGS \" -Wl,--disable-new-dtags\")\n"
+        "endif()",
+        1,
+    )
+    print("[patch] CMakeLists.txt(1.4.x): 改链外部 openGauss libpq + 注入 rpath=$ORIGIN(DT_RPATH)")
+
+else:
+    raise AssertionError(
+        "无法识别的 CMakeLists.txt 架构: 既无 find_package(PostgreSQL REQUIRED) 也无 LIBPG_SOURCES_FULLPATH")
 
 with io.open(cm, "w", encoding="utf-8") as f:
     f.write(s)
-print("[patch] CMakeLists.txt 已重定向 libpq 并注入 rpath=$ORIGIN(DT_RPATH)")
 PYEOF
 
 # (d) 默认 TEXT 协议 + 入口重命名: postgres_extension.cpp
@@ -236,9 +343,21 @@ s = s.replace(entry_old, entry_new, 1)
 # 存储扩展键、per-connection state 键、text 协议开关 全部改为独立命名。
 assert '= {"postgres", "config",' in s, "未找到 secret 函数声明"
 s = s.replace('= {"postgres", "config",', '= {"opengauss", "config",')
-assert 'StorageExtension::Register(config, "postgres_scanner"' in s, "未找到存储扩展注册键"
-s = s.replace('StorageExtension::Register(config, "postgres_scanner"',
-              'StorageExtension::Register(config, "opengauss"')
+# 存储扩展注册键: 1.5.x 用 StorageExtension::Register(...), 1.4.x 用 storage_extensions[...]
+if 'StorageExtension::Register(config, "postgres_scanner"' in s:
+    s = s.replace('StorageExtension::Register(config, "postgres_scanner"',
+                  'StorageExtension::Register(config, "opengauss"')
+elif 'storage_extensions["postgres_scanner"]' in s:
+    s = s.replace('storage_extensions["postgres_scanner"]',
+                  'storage_extensions["opengauss"]')
+else:
+    raise AssertionError("未找到存储扩展注册键(StorageExtension::Register / storage_extensions)")
+# secret 类型名与 provider: 1.4.x 在本文件里(1.5.x 在 postgres_secrets.cpp, 见 d1b)。
+# 存在才替换, 以兼容两种布局。
+if 'secret_type.name = "postgres";' in s:
+    s = s.replace('secret_type.name = "postgres";', 'secret_type.name = "opengauss";')
+if 'prefix_paths, "postgres", "config"' in s:
+    s = s.replace('prefix_paths, "postgres", "config"', 'prefix_paths, "opengauss", "config"')
 assert s.count('"postgres_extension"') == 2, "registered_state 键数量异常"
 s = s.replace('"postgres_extension"', '"opengauss_extension"')
 assert '"pg_use_text_protocol"' in s, "未找到 pg_use_text_protocol 选项名"
@@ -274,8 +393,10 @@ rebrand_replace "src/storage/postgres_clear_cache.cpp" \
 	'"pg_clear_cache"' '"opengauss_clear_cache"'
 
 rebrand_replace "src/postgres_binary_copy.cpp" \
-	'read_postgres_binary' 'read_opengauss_binary' \
 	'"postgres_binary"' '"opengauss_binary"'
+# read_postgres_binary 读函数为 1.5.x 新增, 1.4.x 无 -> 存在才改
+rebrand_replace_opt "src/postgres_binary_copy.cpp" \
+	'read_postgres_binary' 'read_opengauss_binary'
 
 rebrand_replace "src/storage/postgres_configure_pool.cpp" \
 	'"postgres_configure_pool"' '"opengauss_configure_pool"'
@@ -313,8 +434,10 @@ rebrand_replace "src/include/postgres_logging.hpp" \
 # (d2) OAuth 桩: openGauss libpq(基于 PG9.2)无新版 OAuth API(PQsetAuthDataHook 等)，
 #       postgres_oauth.cpp 无法编译。用 no-op 桩替换(openGauss 家族不使用 OAuth)，
 #       保留被其它文件引用的两个导出函数，调用点无需改动。
-edit_begin "src/postgres_oauth.cpp"
-cat > "${PG_SRC_DIR}/src/postgres_oauth.cpp" <<'CPPEOF'
+#       注: OAuth 支持是 1.5.x 新增, 1.4.x 无此文件 -> 存在才打。
+if [[ -f "${PG_SRC_DIR}/src/postgres_oauth.cpp" ]]; then
+	edit_begin "src/postgres_oauth.cpp"
+	cat > "${PG_SRC_DIR}/src/postgres_oauth.cpp" <<'CPPEOF'
 // [opengauss_scanner] OAuth 在 openGauss 家族不适用，替换为 no-op 桩，
 // 以兼容不含新版 OAuth API 的 openGauss libpq。
 #include "postgres_oauth.hpp"
@@ -333,7 +456,10 @@ OAuthTokenHolder SetThreadLocalOAuthTokenFromSessionOption(ClientContext &) {
 
 } // namespace duckdb
 CPPEOF
-echo "[patch] postgres_oauth.cpp 已替换为 no-op 桩(兼容 openGauss libpq)"
+	echo "[patch] postgres_oauth.cpp 已替换为 no-op 桩(兼容 openGauss libpq)"
+else
+	echo "[patch] postgres_oauth.cpp 不存在(此 duckdb 版本无 OAuth 特性), 跳过"
+fi
 
 # (d3) GCC11 兼容 + 重命名: postgres_scanner 新版(含 RemoteExecute 特性)写法
 #      `return func_ref;`（派生类 unique_ptr<TableFunctionRef> 隐式转基类
@@ -366,20 +492,27 @@ PYEOF
 # (d4) GCC11 兼容: postgres_secret_storage.cpp `return secret;`
 #      (unique_ptr<BaseSecret> 隐式转 unique_ptr<const BaseSecret>，非常量→常量)
 #      同属具名局部返回值隐式移动限制，改为显式 std::move。
-edit_begin "src/storage/postgres_secret_storage.cpp"
-python3 - "${PG_SRC_DIR}/src/storage/postgres_secret_storage.cpp" <<'PYEOF'
+#      注: secret_storage 是 1.5.x 新增文件, 1.4.x 无 -> 存在才打。
+if [[ -f "${PG_SRC_DIR}/src/storage/postgres_secret_storage.cpp" ]]; then
+	edit_begin "src/storage/postgres_secret_storage.cpp"
+	python3 - "${PG_SRC_DIR}/src/storage/postgres_secret_storage.cpp" <<'PYEOF'
 import sys, io
 p = sys.argv[1]
 with io.open(p, encoding="utf-8") as f:
     s = f.read()
 old = "\tdeserializer.End();\n\n\treturn secret;\n"
 new = "\tdeserializer.End();\n\n\treturn std::move(secret);\n"
-assert old in s, "postgres_secret_storage.cpp 中未找到预期的 DeserializeSecret 返回片段"
-s = s.replace(old, new, 1)
-with io.open(p, "w", encoding="utf-8") as f:
-    f.write(s)
-print("[patch] postgres_secret_storage.cpp: return secret -> return std::move(secret) (GCC11 兼容)")
+if old in s:
+    s = s.replace(old, new, 1)
+    with io.open(p, "w", encoding="utf-8") as f:
+        f.write(s)
+    print("[patch] postgres_secret_storage.cpp: return secret -> return std::move(secret) (GCC11 兼容)")
+else:
+    print("[patch] postgres_secret_storage.cpp: 未见预期返回片段, 跳过")
 PYEOF
+else
+	echo "[patch] postgres_secret_storage.cpp 不存在(此 duckdb 版本无该文件), 跳过"
+fi
 
 # (e) vcpkg.json 移除 libpq，避免误拉标准 libpq(本构建不使用 vcpkg)
 if [[ -f "${PG_SRC_DIR}/vcpkg.json" ]]; then
